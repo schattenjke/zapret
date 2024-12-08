@@ -432,6 +432,7 @@ jobs:
 
       - name: Push binaries to repo
         run: |
+          cd ${{ env.repo_dir }} 
           git status
           git add .
           git commit -m "Added binaries"
