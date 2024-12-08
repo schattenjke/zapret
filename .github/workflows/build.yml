@@ -349,6 +349,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [ build-linux, build-windows, build-macos, build-freebsd, build-android ]
     permissions:
       contents: write
@@ -429,6 +430,14 @@ jobs:
           done
           ls -lhR
 
+      - name: Push binaries to repo
+        run: |
+          git status
+          git add .
+          git commit -m "Added binaries"
+          git fetch origin master
+          git push origin HEAD:master
+          
       - name: Create release bundles
         run: |
           rm -rf ${{ env.repo_dir }}/.git*
