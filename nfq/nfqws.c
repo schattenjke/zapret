@@ -192,7 +192,7 @@ static bool nfq_init(struct nfq_handle **h,struct nfq_q_handle **qh)
 
 	DLOG_CONDUP("binding this socket to queue '%u'\n", params.qnum);
 	*qh = nfq_create_queue(*h, params.qnum, &nfq_cb, &params);
-	if (!qh) {
+	if (!*qh) {
 		DLOG_PERROR("nfq_create_queue()");
 		goto exiterr;
 	}
@@ -238,18 +238,15 @@ static int nfq_main(void)
 	int fd,e;
 	ssize_t rd;
 
-#ifndef __CYGWIN__
 	sec_harden();
-
 	if (params.droproot && !droproot(params.uid, params.gid))
-		goto exiterr;
-
+		return 1;
 	print_id();
-#endif
 
 	pre_desync();
 
-	nfq_init(&h,&qh);
+	if (!nfq_init(&h,&qh))
+		return 1;
 
 	fd = nfq_fd(h);
 	do
@@ -272,13 +269,7 @@ static int nfq_main(void)
 	} while(e==ENOBUFS);
 
 	nfq_deinit(&h,&qh);
-
 	return 0;
-
-exiterr:
-	if (qh) nfq_destroy_queue(qh);
-	if (h) nfq_close(h);
-	return 1;
 }
 
 #elif defined(BSD)
