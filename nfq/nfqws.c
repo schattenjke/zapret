@@ -84,8 +84,6 @@ static void pre_desync(void)
 	signal(SIGHUP, onhup);
 	signal(SIGUSR1, onusr1);
 	signal(SIGUSR2, onusr2);
-
-	desync_init();
 }
 
 
@@ -303,8 +301,6 @@ static int dvt_main(void)
 			DLOG_PERROR("bind (DIVERT4)");
 			goto exiterr;
 		}
-		if (!set_socket_buffers(fd[0],Q_RCVBUF,Q_SNDBUF))
-			goto exiterr;
 	}
 
 
@@ -985,6 +981,7 @@ static bool wf_make_pf(char *opt, const char *l4, const char *portname, char *bu
 #define DIVERT_NO_LOCALNETS_SRC "(" DIVERT_NO_LOCALNETSv4_SRC " or " DIVERT_NO_LOCALNETSv6_SRC ")"
 #define DIVERT_NO_LOCALNETS_DST "(" DIVERT_NO_LOCALNETSv4_DST " or " DIVERT_NO_LOCALNETSv6_DST ")"
 
+#define DIVERT_TCP_NOT_EMPTY "(!tcp or tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength>0)"
 #define DIVERT_TCP_INBOUNDS "(tcp.Ack and tcp.Syn or tcp.Rst or tcp.Fin)"
 
 // HTTP/1.? 30(2|7)
@@ -1002,6 +999,7 @@ static bool wf_make_filter(
 	char pf_dst_buf[512],iface[64];
 	const char *pf_dst;
 	const char *f_tcpin = *pf_tcp_src ? dp_list_have_autohostlist(&params.desync_profiles) ? "(" DIVERT_TCP_INBOUNDS " or (" DIVERT_HTTP_REDIRECT "))" : DIVERT_TCP_INBOUNDS : "";
+	const char *f_tcp_not_empty = *pf_tcp_src ? DIVERT_TCP_NOT_EMPTY " and " : "";
 
 	snprintf(iface,sizeof(iface)," ifIdx=%u and subIfIdx=%u and",IfIdx,SubIfIdx);
 
@@ -1014,9 +1012,10 @@ static bool wf_make_filter(
 	else
 		pf_dst = *pf_tcp_dst ? pf_tcp_dst : pf_udp_dst;
 	snprintf(wf,len,
- 	       DIVERT_PROLOG " and%s%s\n ((outbound and %s%s)\n  or\n  (inbound and tcp%s%s%s%s%s%s%s))",
+	       DIVERT_PROLOG " and%s%s\n ((outbound and %s%s%s)\n  or\n  (inbound and tcp%s%s%s%s%s%s%s))",
 		IfIdx ? iface : "",
 		ipv4 ? ipv6 ? "" : " ip and" : " ipv6 and",
+		f_tcp_not_empty,
 		pf_dst,
 		ipv4 ? ipv6 ? " and " DIVERT_NO_LOCALNETS_DST : " and " DIVERT_NO_LOCALNETSv4_DST : " and " DIVERT_NO_LOCALNETSv6_DST,
 		*pf_tcp_src ? "" : " and false",
@@ -1193,6 +1192,27 @@ void config_from_file(const char *filename)
 	}
 }
 #endif
+
+void check_dp(const struct desync_profile *dp)
+{
+	// only linux has connbytes limiter
+	if (dp->desync_any_proto && !dp->desync_cutoff &&
+		(dp->desync_mode==DESYNC_FAKE || dp->desync_mode==DESYNC_RST || dp->desync_mode==DESYNC_RSTACK ||
+		 dp->desync_mode==DESYNC_FAKEDSPLIT || dp->desync_mode==DESYNC_FAKEDDISORDER || dp->desync_mode2==DESYNC_FAKEDSPLIT || dp->desync_mode2==DESYNC_FAKEDDISORDER))
+	{
+#ifdef __linux__
+		DLOG_CONDUP("WARNING !!! in profile %d you are using --dpi-desync-any-protocol without --dpi-desync-cutoff\n", dp->n);
+		DLOG_CONDUP("WARNING !!! it's completely ok if connbytes or payload based ip/nf tables limiter is applied. Make sure it exists.\n");
+#else
+		DLOG_CONDUP("WARNING !!! possible TRASH FLOOD configuration detected in profile %d\n", dp->n);
+		DLOG_CONDUP("WARNING !!! it's highly recommended to use --dpi-desync-cutoff limiter or fakes will be sent on every processed packet\n");
+		DLOG_CONDUP("WARNING !!! make sure it's really what you want\n");
+#ifdef __CYGWIN__
+		DLOG_CONDUP("WARNING !!! in most cases this is acceptable only with custom payload based windivert filter (--wf-raw)\n");
+#endif
+#endif
+	}
+}
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
@@ -1954,6 +1974,7 @@ int main(int argc, char **argv)
 			}
 			else
 			{
+				check_dp(dp);
 				if (!(dpl = dp_list_add(&params.desync_profiles)))
 				{
 					DLOG_ERR("desync_profile_add: out of memory\n");
@@ -2158,6 +2179,8 @@ int main(int argc, char **argv)
 		dp_entry_destroy(dpl);
 		desync_profile_count--;
 	}
+	else
+		check_dp(dp);
 
 	// do not need args from file anymore
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
@@ -2244,9 +2267,9 @@ int main(int argc, char **argv)
 		if (dp->desync_ttl6 == 0xFF) dp->desync_ttl6=dp->desync_ttl;
 		if (!AUTOTTL_ENABLED(dp->desync_autottl6)) dp->desync_autottl6 = dp->desync_autottl;
 		if (AUTOTTL_ENABLED(dp->desync_autottl))
-			DLOG("[profile %d] autottl ipv4 %u:%u-%u\n",dp->n,dp->desync_autottl.delta,dp->desync_autottl.min,dp->desync_autottl.max);
+			DLOG("profile %d autottl ipv4 %u:%u-%u\n",dp->n,dp->desync_autottl.delta,dp->desync_autottl.min,dp->desync_autottl.max);
 		if (AUTOTTL_ENABLED(dp->desync_autottl6))
-			DLOG("[profile %d] autottl ipv6 %u:%u-%u\n",dp->n,dp->desync_autottl6.delta,dp->desync_autottl6.min,dp->desync_autottl6.max);
+			DLOG("profile %d autottl ipv6 %u:%u-%u\n",dp->n,dp->desync_autottl6.delta,dp->desync_autottl6.min,dp->desync_autottl6.max);
 		split_compat(dp);
 #ifndef __CYGWIN__
 		if (params.droproot && dp->hostlist_auto && chown(dp->hostlist_auto->filename, params.uid, -1))
