@@ -1,5 +1,5 @@
 [ -n "$ZAPRET_NFT_TABLE" ] || ZAPRET_NFT_TABLE=zapret
-readonly nft_connbytes="ct original packets"
+nft_connbytes="ct original packets"
 
 # required for : nft -f -
 create_dev_stdin
@@ -263,28 +263,6 @@ nft_add_flow_offload_exemption()
 	[ "$DISABLE_IPV6" = "1" -o -z "$2" ] || nft_add_rule flow_offload oifname @wanif6 $2 ip6 daddr != @nozapret6 return comment \"$3\"
 }
 
-nft_hw_offload_supported()
-{
-	# $1,$2,... - interface names
-	local devices res=1
-	make_quoted_comma_list devices "$@"
-	[ -n "$devices" ] && devices="devices={$devices};"
-	nft add table ${ZAPRET_NFT_TABLE}_test && nft add flowtable ${ZAPRET_NFT_TABLE}_test ft "{ flags offload; $devices }" 2>/dev/null && res=0
-	nft delete table ${ZAPRET_NFT_TABLE}_test 2>/dev/null
-	return $res
-}
-
-nft_hw_offload_find_supported()
-{
-	# $1,$2,... - interface names
-	local supported_list
-	while [ -n "$1" ]; do
-		nft_hw_offload_supported "$1" && append_separator_list supported_list ' ' '' "$1"
-		shift
-	done
-	echo $supported_list
-}
-
 nft_apply_flow_offloading()
 {
 	# ft can be absent
@@ -370,17 +348,15 @@ flush set inet $ZAPRET_NFT_TABLE lanif"
 			nft_create_or_update_flowtable 'offload' 2>/dev/null
 			# then add elements. some of them can cause error because unsupported
 			for i in $ALLDEVS; do
-				if nft_hw_offload_supported $i; then
-					nft_create_or_update_flowtable 'offload' $i
-				else
-					# bridge members must be added instead of the bridge itself
-					# some members may not support hw offload. example : lan1 lan2 lan3 support, wlan0 wlan1 - not
-					devs=$(resolve_lower_devices $i)
-					for j in $devs; do
-						# do not display error if addition failed
-						nft_create_or_update_flowtable 'offload' $j 2>/dev/null
-					done
-				fi
+				# first try to add interface itself
+				nft_create_or_update_flowtable 'offload' $i 2>/dev/null
+				# bridge members must be added instead of the bridge itself
+				# some members may not support hw offload. example : lan1 lan2 lan3 support, wlan0 wlan1 - not
+				devs=$(resolve_lower_devices $i)
+				for j in $devs; do
+					# do not display error if addition failed
+					nft_create_or_update_flowtable 'offload' $j 2>/dev/null
+				done
 			done
 			;;
 	esac
@@ -411,8 +387,8 @@ _nft_fw_tpws4()
 	[ "$DISABLE_IPV4" = "1" -o -z "$1" ] || {
 		local filter="$1" port="$2"
 		nft_print_op "$filter" "tpws (port $2)" 4
-		nft_insert_rule dnat_output skuid != $WS_USER ${3:+oifname @wanif }$filter ip daddr != @nozapret $FW_EXTRA_POST dnat ip to $TPWS_LOCALHOST4:$port
-		nft_insert_rule dnat_pre iifname @lanif $filter ip daddr != @nozapret $FW_EXTRA_POST dnat ip to $TPWS_LOCALHOST4:$port
+		nft_insert_rule dnat_output skuid != $WS_USER ${3:+oifname @wanif }$filter ip daddr != @nozapret ip daddr != @ipban $FW_EXTRA_POST dnat ip to $TPWS_LOCALHOST4:$port
+		nft_insert_rule dnat_pre iifname @lanif $filter ip daddr != @nozapret ip daddr != @ipban $FW_EXTRA_POST dnat ip to $TPWS_LOCALHOST4:$port
 		prepare_route_localnet
 	}
 }
@@ -426,9 +402,9 @@ _nft_fw_tpws6()
 	[ "$DISABLE_IPV6" = "1" -o -z "$1" ] || {
 		local filter="$1" port="$2" DNAT6 i
 		nft_print_op "$filter" "tpws (port $port)" 6
-		nft_insert_rule dnat_output skuid != $WS_USER ${4:+oifname @wanif6 }$filter ip6 daddr != @nozapret6 $FW_EXTRA_POST dnat ip6 to [::1]:$port
+		nft_insert_rule dnat_output skuid != $WS_USER ${4:+oifname @wanif6 }$filter ip6 daddr != @nozapret6 ip6 daddr != @ipban6 $FW_EXTRA_POST dnat ip6 to [::1]:$port
 		[ -n "$3" ] && {
-			nft_insert_rule dnat_pre $filter ip6 daddr != @nozapret6 $FW_EXTRA_POST dnat ip6 to iifname map @link_local:$port
+			nft_insert_rule dnat_pre $filter ip6 daddr != @nozapret6 ip6 daddr != @ipban6 $FW_EXTRA_POST dnat ip6 to iifname map @link_local:$port
 			for i in $3; do
 				_dnat6_target $i DNAT6
 				# can be multiple tpws processes on different ports
