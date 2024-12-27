@@ -147,7 +147,6 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    if: false
     name: macOS
     runs-on: macos-latest
     steps:
@@ -168,7 +167,6 @@ jobs:
           if-no-files-found: error
 
   build-freebsd:
-    if: false
     name: FreeBSD ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -307,7 +305,6 @@ jobs:
           if-no-files-found: error
 
   build-android:
-    if: false
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-latest
     strategy:
@@ -374,7 +371,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [ build-linux, build-windows ]
+    needs: [ build-linux, build-windows, build-macos, build-freebsd, build-android ]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -465,7 +462,7 @@ jobs:
           git commit -m "Added binaries"
           git fetch origin master
           git push origin HEAD:master
-          
+
       - name: Create release bundles
         run: |
           rm -rf ${{ env.repo_dir }}/.git*
