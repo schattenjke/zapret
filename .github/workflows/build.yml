@@ -475,7 +475,6 @@ jobs:
 
       - name: Push binaries to repo
         run: |
-          git init
           cd ${{ env.repo_dir }}
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
