@@ -192,20 +192,21 @@ static bool set_seccomp(void)
 
 bool sec_harden(void)
 {
+	bool bRes = true;
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
 	{
 		DLOG_PERROR("PR_SET_NO_NEW_PRIVS(prctl)");
-		return false;
+		bRes = false;
 	}
 #if ARCH_NR!=0
 	if (!set_seccomp())
 	{
 		DLOG_PERROR("seccomp");
 		if (errno==EINVAL) DLOG_ERR("seccomp: this can be safely ignored if kernel does not support seccomp\n");
-		return false;
+		bRes = false;
 	}
 #endif
-	return true;
+	return bRes;
 }
 
 
@@ -294,8 +295,13 @@ bool can_drop_root(void)
 #endif
 }
 
-bool droproot(uid_t uid, gid_t gid)
+bool droproot(uid_t uid, const char *user, const gid_t *gid, int gid_count)
 {
+	if (gid_count<1)
+	{
+		DLOG_ERR("droproot: no groups specified");
+		return false;
+	}
 #ifdef __linux__
 	if (prctl(PR_SET_KEEPCAPS, 1L))
 	{
@@ -303,13 +309,25 @@ bool droproot(uid_t uid, gid_t gid)
 		return false;
 	}
 #endif
-	// drop all SGIDs
-	if (setgroups(0,NULL))
+	if (user)
 	{
-		DLOG_PERROR("setgroups");
-		return false;
+		// macos has strange supp gid handling. they cache only 16 groups and fail setgroups if more than 16 gids specified.
+		// better to leave it to the os
+		if (initgroups(user,gid[0]))
+		{
+			DLOG_PERROR("initgroups");
+			return false;
+		}
 	}
-	if (setgid(gid))
+	else
+	{
+		if (setgroups(gid_count,gid))
+		{
+			DLOG_PERROR("setgroups");
+			return false;
+		}
+	}
+	if (setgid(gid[0]))
 	{
 		DLOG_PERROR("setgid");
 		return false;
@@ -342,9 +360,13 @@ void print_id(void)
 #endif
 
 
+
 void daemonize(void)
 {
 	int pid;
+#ifdef __CYGWIN__
+	char *cwd = get_current_dir_name();
+#endif
 
 	pid = fork();
 	if (pid == -1)
@@ -354,6 +376,10 @@ void daemonize(void)
 	}
 	else if (pid != 0)
 		exit(0);
+
+#ifdef __CYGWIN__
+	chdir(get_current_dir_name());
+#endif
 
 	if (setsid() == -1)
 		exit(2);

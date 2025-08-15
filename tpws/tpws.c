@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <syslog.h>
+#include <grp.h>
 
 #ifdef __ANDROID__
 #include "andr/ifaddrs.h"
@@ -86,6 +87,12 @@ static void onusr2(int sig)
 	{
 		printf("\nDESYNC PROFILE %d\n",dpl->dp.n);
 		HostFailPoolDump(dpl->dp.hostlist_auto_fail_counters);
+	}
+
+	if (params.cache_hostname)
+	{
+		printf("\nIPCACHE\n");
+		ipcachePrint(&params.ipcache);
 	}
 
 	printf("\n");
@@ -208,14 +215,20 @@ static void exithelp(void)
 		" --daemon\t\t\t\t; daemonize\n"
 		" --pidfile=<filename>\t\t\t; write pid to file\n"
 		" --user=<username>\t\t\t; drop root privs\n"
-		" --uid=uid[:gid]\t\t\t; drop root privs\n"
-#if defined(__FreeBSD__)
+		" --uid=uid[:gid1,gid2,...]\t\t; drop root privs\n"
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 		" --enable-pf\t\t\t\t; enable PF redirector support. required in FreeBSD when used with PF firewall.\n"
 #endif
 #if defined(__linux__)
 		" --fix-seg=<int>\t\t\t; fix segmentation failures at the cost of possible slowdown. wait up to N msec (default %u)\n"
 #endif
+		" --ipcache-lifetime=<int>\t\t; time in seconds to keep cached domain name (default %u). 0 = no expiration\n"
+		" --ipcache-hostname=[0|1]\t\t; 1 or no argument enables ip->hostname caching\n"
+#ifdef __ANDROID__
+		" --debug=0|1|2|syslog|android|@<filename> ; 1 and 2 means log to console and set debug level. for other targets use --debug-level.\n"
+#else
 		" --debug=0|1|2|syslog|@<filename>\t; 1 and 2 means log to console and set debug level. for other targets use --debug-level.\n"
+#endif
 		" --debug-level=0|1|2\t\t\t; specify debug level\n"
 		" --dry-run\t\t\t\t; verify parameters and exit with code 0 if successful\n"
 		" --version\t\t\t\t; print version and exit\n"
@@ -272,35 +285,19 @@ static void exithelp(void)
 #ifdef __linux__
 		FIX_SEG_DEFAULT_MAX_WAIT,
 #endif
+		IPCACHE_LIFETIME,
 		HOSTLIST_AUTO_FAIL_THRESHOLD_DEFAULT, HOSTLIST_AUTO_FAIL_TIME_DEFAULT
 	);
 	exit(1);
 }
-#if !defined( __OpenBSD__) && !defined(__ANDROID__)
-static void cleanup_args()
-{
-	wordfree(&params.wexp);
-}
-#endif
-static void cleanup_params(void)
-{
-#if !defined( __OpenBSD__) && !defined(__ANDROID__)
-	cleanup_args();
-#endif
-
-	dp_list_destroy(&params.desync_profiles);
-
-	hostlist_files_destroy(&params.hostlists);
-	ipset_files_destroy(&params.ipsets);
-}
 static void exithelp_clean(void)
 {
-	cleanup_params();
+	cleanup_params(&params);
 	exithelp();
 }
 static void exit_clean(int code)
 {
-	cleanup_params();
+	cleanup_params(&params);
 	exit(code);
 }
 static void nextbind_clean(void)
@@ -573,6 +570,35 @@ static bool parse_ip_list(char *opt, ipset *pp)
 	return true;
 }
 
+static bool parse_uid(const char *opt, uid_t *uid, gid_t *gid, int *gid_count, int max_gids)
+{
+	unsigned int u;
+	char c, *p, *e;
+
+	*gid_count=0;
+	if ((e = strchr(optarg,':'))) *e++=0;
+	if (sscanf(opt,"%u",&u)!=1) return false;
+	*uid = (uid_t)u;
+	for (p=e ; p ; )
+	{
+		if ((e = strchr(p,',')))
+		{
+			c=*e;
+			*e=0;
+		}
+		if (p)
+		{
+			if (sscanf(p,"%u",&u)!=1) return false;
+			if (*gid_count>=max_gids) return false;
+			gid[(*gid_count)++] = (gid_t)u;
+		}
+		if (e) *e++=c;
+		p = e;
+	}
+	return true;
+}
+
+
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
 // no static to not allow optimizer to inline this func (save stack)
 void config_from_file(const char *filename)
@@ -628,6 +654,8 @@ enum opt_indices {
 	IDX_MAXCONN,
 	IDX_MAXFILES,
 	IDX_MAX_ORPHAN_TIME,
+	IDX_IPCACHE_LIFETIME,
+	IDX_IPCACHE_HOSTNAME,
 	IDX_HOSTCASE,
 	IDX_HOSTSPELL,
 	IDX_HOSTDOT,
@@ -683,7 +711,7 @@ enum opt_indices {
 	IDX_IPSET_EXCLUDE,
 	IDX_IPSET_EXCLUDE_IP,
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 	IDX_ENABLE_PF,
 #elif defined(__APPLE__)
 	IDX_LOCAL_TCP_USER_TIMEOUT,
@@ -718,6 +746,8 @@ static const struct option long_options[] = {
 	[IDX_UID] = {"uid", required_argument, 0, 0},
 	[IDX_MAXCONN] = {"maxconn", required_argument, 0, 0},
 	[IDX_MAXFILES] = {"maxfiles", required_argument, 0, 0},
+	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
+	[IDX_IPCACHE_HOSTNAME] = {"ipcache-hostname", optional_argument, 0, 0},
 	[IDX_MAX_ORPHAN_TIME] = {"max-orphan-time", required_argument, 0, 0},
 	[IDX_HOSTCASE] = {"hostcase", no_argument, 0, 0},
 	[IDX_HOSTSPELL] = {"hostspell", required_argument, 0, 0},
@@ -774,7 +804,7 @@ static const struct option long_options[] = {
 	[IDX_IPSET_EXCLUDE] = {"ipset-exclude", required_argument, 0, 0},
 	[IDX_IPSET_EXCLUDE_IP] = {"ipset-exclude-ip", required_argument, 0, 0},
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 	[IDX_ENABLE_PF] = {"enable-pf", no_argument, 0, 0},
 #elif defined(__APPLE__)
 	[IDX_LOCAL_TCP_USER_TIMEOUT] = {"local-tcp-user-timeout", required_argument, 0, 0},
@@ -804,12 +834,13 @@ void parse_params(int argc, char *argv[])
 	params.maxconn = DEFAULT_MAX_CONN;
 	params.max_orphan_time = DEFAULT_MAX_ORPHAN_TIME;
 	params.binds_last = -1;
+	params.ipcache_lifetime = IPCACHE_LIFETIME;
 #if defined(__linux__) || defined(__APPLE__)
 	params.tcp_user_timeout_local = DEFAULT_TCP_USER_TIMEOUT_LOCAL;
 	params.tcp_user_timeout_remote = DEFAULT_TCP_USER_TIMEOUT_REMOTE;
 #endif
 
-#if defined(__OpenBSD__) || defined(__APPLE__)
+#if defined(__APPLE__)
 	params.pf_enable = true; // OpenBSD and MacOS have no other choice
 #endif
 
@@ -822,8 +853,9 @@ void parse_params(int argc, char *argv[])
 
 	if (can_drop_root())
 	{
-	    params.uid = params.gid = 0x7FFFFFFF; // default uid:gid
-	    params.droproot = true;
+		params.uid = params.gid[0] = 0x7FFFFFFF; // default uid:gid
+		params.gid_count = 1;
+		params.droproot = true;
 	}
 
 	struct desync_profile_list *dpl;
@@ -932,6 +964,7 @@ void parse_params(int argc, char *argv[])
 			break;
 		case IDX_USER:
 		{
+			free(params.user); params.user=NULL;
 			struct passwd *pwd = getpwnam(optarg);
 			if (!pwd)
 			{
@@ -939,18 +972,29 @@ void parse_params(int argc, char *argv[])
 				exit_clean(1);
 			}
 			params.uid = pwd->pw_uid;
-			params.gid = pwd->pw_gid;
+			params.gid[0]=pwd->pw_gid;
+			params.gid_count=1;
+			if (!(params.user=strdup(optarg)))
+			{
+				DLOG_ERR("strdup: out of memory\n");
+				exit_clean(1);
+			}
 			params.droproot = true;
 			break;
 		}
 		case IDX_UID:
-			params.gid=0x7FFFFFFF; // default git. drop gid=0
-			params.droproot = true;
-			if (sscanf(optarg,"%u:%u",&params.uid,&params.gid)<1)
+			free(params.user); params.user=NULL;
+			if (!parse_uid(optarg,&params.uid,params.gid,&params.gid_count,MAX_GIDS))
 			{
-				DLOG_ERR("--uid should be : uid[:gid]\n");
+				DLOG_ERR("--uid should be : uid[:gid,gid,...]\n");
 				exit_clean(1);
 			}
+			if (!params.gid_count)
+			{
+				params.gid[0] = 0x7FFFFFFF;
+				params.gid_count = 1;
+			}
+			params.droproot = true;
 			break;
 		case IDX_MAXCONN:
 			params.maxconn = atoi(optarg);
@@ -975,6 +1019,16 @@ void parse_params(int argc, char *argv[])
 				DLOG_ERR("bad max_orphan_time\n");
 				exit_clean(1);
 			}
+			break;
+		case IDX_IPCACHE_LIFETIME:
+			if (sscanf(optarg, "%u", &params.ipcache_lifetime)!=1)
+			{
+				DLOG_ERR("invalid ipcache-lifetime value\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_IPCACHE_HOSTNAME:
+			params.cache_hostname = !optarg || !!atoi(optarg);
 			break;
 		case IDX_HOSTCASE:
 			dp->hostcase = true;
@@ -1248,8 +1302,7 @@ void parse_params(int argc, char *argv[])
 			}
 			break;
 		case IDX_PIDFILE:
-			strncpy(params.pidfile,optarg,sizeof(params.pidfile));
-			params.pidfile[sizeof(params.pidfile)-1]='\0';
+			snprintf(params.pidfile,sizeof(params.pidfile),"%s",optarg);
 			break;
 		case IDX_DEBUG:
 			if (optarg)
@@ -1271,12 +1324,24 @@ void parse_params(int argc, char *argv[])
 				{
 					if (!params.debug) params.debug = 1;
 					params.debug_target = LOG_TARGET_SYSLOG;
-					openlog("tpws",LOG_PID,LOG_USER);
+					openlog(progname,LOG_PID,LOG_USER);
 				}
-				else
+#ifdef __ANDROID__
+				else if (!strcmp(optarg,"android"))
+				{
+					if (!params.debug) params.debug = 1;
+					params.debug_target = LOG_TARGET_ANDROID;
+				}
+#endif
+				else if (optarg[0]>='0' && optarg[0]<='2')
 				{
 					params.debug = atoi(optarg);
 					params.debug_target = LOG_TARGET_CONSOLE;
+				}
+				else
+				{
+					fprintf(stderr, "invalid debug mode : %s\n", optarg);
+					exit_clean(1);
 				}
 			}
 			else
@@ -1489,7 +1554,7 @@ void parse_params(int argc, char *argv[])
 			params.tamper = true;
 			break;
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 		case IDX_ENABLE_PF:
 			params.pf_enable = true;
 			break;
@@ -1613,6 +1678,9 @@ void parse_params(int argc, char *argv[])
 	}
 #endif
 
+	if (!test_list_files())
+		exit_clean(1);
+
 	if (!LoadAllHostLists())
 	{
 		DLOG_ERR("hostlists load failed\n");
@@ -1634,10 +1702,22 @@ void parse_params(int argc, char *argv[])
 
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
 	// do not need args from file anymore
-	cleanup_args();
+	cleanup_args(&params);
 #endif
 	if (bDry)
 	{
+		if (params.droproot)
+		{
+			if (!droproot(params.uid,params.user,params.gid,params.gid_count))
+				exit_clean(1);
+#ifdef __linux__
+			if (!dropcaps())
+				exit_clean(1);
+#endif
+			print_id();
+			if (!test_list_files())
+				exit_clean(1);
+		}
 		DLOG_CONDUP("command line parameters verified\n");
 		exit_clean(0);
 	}
@@ -1794,9 +1874,17 @@ static const char *bindll_s[] = { "unwanted","no","prefer","force" };
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
 #if defined(ZAPRET_GH_VER) || defined (ZAPRET_GH_HASH)
+#ifdef __ANDROID__
+#define PRINT_VER printf("github android version %s (%s)\n\n", TOSTRING(ZAPRET_GH_VER), TOSTRING(ZAPRET_GH_HASH))
+#else
 #define PRINT_VER printf("github version %s (%s)\n\n", TOSTRING(ZAPRET_GH_VER), TOSTRING(ZAPRET_GH_HASH))
+#endif
+#else
+#ifdef __ANDROID__
+#define PRINT_VER printf("self-built android version %s %s\n\n", __DATE__, __TIME__)
 #else
 #define PRINT_VER printf("self-built version %s %s\n\n", __DATE__, __TIME__)
+#endif
 #endif
 
 int main(int argc, char *argv[])
@@ -1804,6 +1892,7 @@ int main(int argc, char *argv[])
 	int i, listen_fd[MAX_BINDS], yes = 1, retval = 0, if_index, exit_v=EXIT_FAILURE;
 	struct salisten_s list[MAX_BINDS];
 	char ip_port[48];
+	FILE *Fpid = NULL;
 
 	set_console_io_buffering();
 	set_env_exedir(argv[0]);
@@ -1814,14 +1903,6 @@ int main(int argc, char *argv[])
 
 	parse_params(argc, argv);
 	argv=NULL; argc=0;
-
-	if (params.daemon) daemonize();
-
-	if (*params.pidfile && !writepid(params.pidfile))
-	{
-		DLOG_ERR("could not write pidfile\n");
-		goto exiterr;
-	}
 
 	memset(&list, 0, sizeof(list));
 	for(i=0;i<=params.binds_last;i++) listen_fd[i]=-1;
@@ -2054,9 +2135,18 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (params.cache_hostname) VPRINT("ipcache lifetime %us\n", params.ipcache_lifetime);
+	DLOG_CONDUP(params.proxy_type==CONN_TYPE_SOCKS ? "socks mode\n" : "transparent proxy mode\n");
+	if (!params.tamper) DLOG_CONDUP("TCP proxy mode (no tampering)\n");
+
+	if (*params.pidfile && !(Fpid=fopen(params.pidfile,"w")))
+	{
+		DLOG_PERROR("create pidfile");
+		goto exiterr;
+	}
+
 	set_ulimit();
-	sec_harden();
-	if (params.droproot && !droproot(params.uid,params.gid))
+	if (params.droproot && !droproot(params.uid,params.user,params.gid,params.gid_count))
 		goto exiterr;
 #ifdef __linux__
 	if (!dropcaps())
@@ -2066,6 +2156,21 @@ int main(int argc, char *argv[])
 	if (params.droproot && !test_list_files())
 		goto exiterr;
 
+	if (params.daemon) daemonize();
+
+	sec_harden();
+
+	if (Fpid)
+	{
+		if (fprintf(Fpid, "%d", getpid())<=0)
+		{
+			DLOG_PERROR("write pidfile");
+			goto exiterr;
+		}
+		fclose(Fpid);
+		Fpid=NULL;
+	}
+
 	//splice() causes the process to receive the SIGPIPE-signal if one part (for
 	//example a socket) is closed during splice(). I would rather have splice()
 	//fail and return -1, so blocking SIGPIPE.
@@ -2073,9 +2178,6 @@ int main(int argc, char *argv[])
 		DLOG_ERR("Could not block SIGPIPE signal\n");
 		goto exiterr;
 	}
-
-	DLOG_CONDUP(params.proxy_type==CONN_TYPE_SOCKS ? "socks mode\n" : "transparent proxy mode\n");
-	if (!params.tamper) DLOG_CONDUP("TCP proxy mode (no tampering)\n");
 
 	signal(SIGHUP, onhup); 
 	signal(SIGUSR2, onusr2);
@@ -2085,8 +2187,9 @@ int main(int argc, char *argv[])
 	DLOG_CONDUP("Exiting\n");
 	
 exiterr:
+	if (Fpid) fclose(Fpid);
 	redir_close();
 	for(i=0;i<=params.binds_last;i++) if (listen_fd[i]!=-1) close(listen_fd[i]);
-	cleanup_params();
+	cleanup_params(&params);
 	return exit_v;
 }

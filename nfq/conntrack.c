@@ -29,6 +29,7 @@ void ConntrackClearHostname(t_ctrack *track)
 {
 	free(track->hostname);
 	track->hostname = NULL;
+	track->hostname_is_ip = false;
 }
 static void ConntrackClearTrack(t_ctrack *track)
 {
@@ -143,8 +144,11 @@ static void ConntrackFeedPacket(t_ctrack *t, bool bReverse, const struct tcphdr 
 		}
 		else if (tcp_synack_segment(tcphdr))
 		{
-			if (t->state!=SYN) ConntrackReInitTrack(t); // erase current entry
-			if (!t->seq0) t->seq0 = ntohl(tcphdr->th_ack)-1;
+			// ignore SA dups
+			uint32_t seq0 = ntohl(tcphdr->th_ack)-1;
+			if (t->state!=SYN && t->seq0!=seq0)
+				ConntrackReInitTrack(t); // erase current entry
+			if (!t->seq0) t->seq0 = seq0;
 			t->ack0 = ntohl(tcphdr->th_seq);
 		}
 		else if (tcphdr->th_flags & (TH_FIN|TH_RST))
@@ -338,8 +342,8 @@ void ConntrackPoolDump(const t_conntrack *p)
 			printf("rseq=%u pos_orig=%u rack=%u pos_reply=%u",
 				t->track.seq_last, t->track.pos_orig,
 				t->track.ack_last, t->track.pos_reply);
-		printf(" req_retrans=%u cutoff=%u wss_cutoff=%u d_cutoff=%u hostname=%s l7proto=%s\n",
-			t->track.req_retrans_counter, t->track.b_cutoff, t->track.b_wssize_cutoff, t->track.b_desync_cutoff, t->track.hostname, l7proto_str(t->track.l7proto));
+		printf(" req_retrans=%u cutoff=%u wss_cutoff=%u desync_cutoff=%u dup_cutoff=%u orig_cutoff=%u hostname=%s l7proto=%s\n",
+			t->track.req_retrans_counter, t->track.b_cutoff, t->track.b_wssize_cutoff, t->track.b_desync_cutoff, t->track.b_dup_cutoff, t->track.b_orig_mod_cutoff, t->track.hostname, l7proto_str(t->track.l7proto));
 	};
 }
 

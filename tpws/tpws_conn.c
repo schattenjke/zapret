@@ -494,6 +494,9 @@ static bool connect_remote_conn(tproxy_conn_t *conn)
 {
 	int mss=0;
 
+	if (conn->track.hostname)
+		if (!ipcache_put_hostname(conn->dest.sa_family==AF_INET ? &((struct sockaddr_in*)&conn->dest)->sin_addr : NULL, conn->dest.sa_family==AF_INET6 ? &((struct sockaddr_in6*)&conn->dest)->sin6_addr : NULL , conn->track.hostname, conn->track.hostname_is_ip))
+			DLOG_ERR("ipcache_put_hostname: out of memory");
 	apply_desync_profile(&conn->track, (struct sockaddr *)&conn->dest);
 
 	if (conn->track.dp && conn->track.dp->mss)
@@ -504,7 +507,7 @@ static bool connect_remote_conn(tproxy_conn_t *conn)
 			if (conn->track.hostname)
 			{
 				bool bHostExcluded;
-				conn->track.b_host_matches = HostlistCheck(conn->track.dp, conn->track.hostname, &bHostExcluded, false);
+				conn->track.b_host_matches = HostlistCheck(conn->track.dp, conn->track.hostname, conn->track.hostname_is_ip, &bHostExcluded, false);
 				conn->track.b_host_checked = true;
 				if (!conn->track.b_host_matches)
 				{
@@ -1087,7 +1090,8 @@ static bool resolve_complete(struct resolve_item *ri, struct tailhead *conn_list
 				if (!conn->track.hostname)
 				{
 					DBGPRINT("resolve_complete put hostname : %s\n", ri->dom);
-					conn->track.hostname = strdup(ri->dom);
+					if (!(conn->track.hostname = strdup(ri->dom)))
+						DLOG_ERR("dup hostname: out of memory\n");
 				}
 				sa46copy(&conn->dest, (struct sockaddr *)&ri->ss);
 				return proxy_mode_connect_remote(conn,conn_list);

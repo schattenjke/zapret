@@ -12,6 +12,7 @@
 // this saves memory. sockaddr_storage is larger than required. it can be 128 bytes. sockaddr_in6 is 28 bytes.
 typedef union
 {
+	sa_family_t sa_family;
 	struct sockaddr_in sa4;		// size 16
 	struct sockaddr_in6 sa6;	// size 28
 } sockaddr_in46;
@@ -27,6 +28,10 @@ bool str_ends_with(const char *s, const char *suffix);
 
 bool load_file(const char *filename,void *buffer,size_t *buffer_size);
 bool append_to_list_file(const char *filename, const char *s);
+
+void expand_bits(void *target, const void *source, unsigned int source_bitlen, unsigned int target_bytelen);
+
+bool strip_host_to_ip(char *host);
 
 void ntop46(const struct sockaddr *sa, char *str, size_t len);
 void ntop46_port(const struct sockaddr *sa, char *str, size_t len);

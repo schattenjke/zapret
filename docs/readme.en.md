@@ -1,9 +1,10 @@
-# zapret v70.6
+# zapret v71.3
 
 # SCAMMER WARNING
 
 This software is free and open source under [MIT license](./LICENSE.txt).
 If anyone demands you to download this software only from their webpage, telegram channel, forces you to delete links, videos, makes copyright claims, you are dealing with scammers.
+However, [donations](#donations) are welcome.
 
 # Multilanguage/Мультиязычный README
 ___
@@ -23,17 +24,23 @@ ___
   - [TCP segmentation](#tcp-segmentation)
   - [Sequence numbers overlap](#sequence-numbers-overlap)
   - [ipv6 specific modes](#ipv6-specific-modes)
+  - [Original modding](#original-modding)
+  - [Duplicates](#duplicates)
   - [Server reply reaction](#server-reply-reaction)
   - [SYNDATA mode](#syndata-mode)
   - [DPI desync combos](#dpi-desync-combos)
+  - [IP cache](#ip-cache)
   - [CONNTRACK](#conntrack)
   - [Reassemble](#reassemble)
   - [UDP support](#udp-support)
   - [IP fragmentation](#ip-fragmentation)
   - [Multiple strategies](#multiple-strategies)
+  - [WIFI filtering](#wifi-filtering)
   - [Virtual machines](#virtual-machines)
   - [IPTABLES for nfqws](#iptables-for-nfqws)
   - [NFTABLES for nfqws](#nftables-for-nfqws)
+  - [Flow offloading](#flow-offloading)
+  - [Server side fooling](#server-side-fooling)
 - [tpws](#tpws)
   - [TCP segmentation in tpws](#tcp-segmentation-in-tpws)
   - [TLSREC](#tlsrec)
@@ -139,24 +146,46 @@ nfqws takes the following parameters:
  --daemon                                       ; daemonize
  --pidfile=<filename>                           ; write pid to file
  --user=<username>                              ; drop root privs
- --uid=uid[:gid]                                ; drop root privs
+ --uid=uid[:gid1,gid2,...]                      ; drop root privs
  --bind-fix4                                    ; apply outgoing interface selection fix for generated ipv4 packets
  --bind-fix6                                    ; apply outgoing interface selection fix for generated ipv6 packets
  --wsize=<window_size>[:<scale_factor>]         ; set window size. 0 = do not modify. OBSOLETE !
  --wssize=<window_size>[:<scale_factor>]        ; set window size for server. 0 = do not modify. default scale_factor = 0.
  --wssize-cutoff=[n|d|s]N                       ; apply server wsize only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
  --ctrack-timeouts=S:E:F[:U]                    ; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default 60:300:60:60
+ --ctrack-disable=[0|1]                         ; 1 or no argument disables conntrack
+ --ipcache-lifetime=<int>                       ; time in seconds to keep cached hop count and domain name (default 7200). 0 = no expiration
+ --ipcache-hostname=[0|1]                       ; 1 or no argument enables ip->hostname caching
  --hostcase                                     ; change Host: => host:
  --hostspell                                    ; exact spelling of "Host" header. must be 4 chars. default is "host"
  --hostnospace                                  ; remove space after Host: and add it to User-Agent: to preserve packet size
  --domcase                                      ; mix domain case : Host: TeSt.cOm
  --methodeol					; add '\n' before method and remove space after Host:
+ --synack-split=[syn|synack|acksyn]             ; perform TCP split handshake : send SYN only, SYN+ACK or ACK+SYN
+ --orig-ttl=<int>                               ; set TTL for original packets
+ --orig-ttl6=<int>                              ; set ipv6 hop limit for original packets. by default ttl value is used
+ --orig-autottl=[<delta>[:<min>[-<max>]]|-]     ; auto ttl mode for both ipv4 and ipv6. default: +5:3-64. "0:0-0" or "-" disables autottl.
+ --orig-autottl6=[<delta>[:<min>[-<max>]]|-]    ; overrides --orig-autottl for ipv6 only
+ --orig-mod-start=[n|d|s]N                      ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
+ --orig-mod-cutoff=[n|d|s]N                     ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
+ --dup=<int>                                    ; duplicate original packets. send N dups before original.
+ --dup-replace=[0|1]                            ; 1 or no argument means do not send original, only dups
+ --dup-ttl=<int>                                ; set TTL for dups
+ --dup-ttl6=<int>                               ; set ipv6 hop limit for dups. by default ttl value is used
+ --dup-autottl=[<delta>[:<min>[-<max>]]|-]      ; auto ttl mode for both ipv4 and ipv6. default: -1:3-64. "0:0-0" or "-" disables autottl.
+ --dup-autottl6=[<delta>[:<min>[-<max>]]|-]     ; overrides --dup-autottl for ipv6 only
+ --dup-fooling=<mode>[,<mode>]                  ; can use multiple comma separated values. modes : none md5sig badseq badsum datanoack hopbyhop hopbyhop2
+ --dup-ts-increment=<int|0xHEX>                 ; ts fooling TSval signed increment for dup. default -600000
+ --dup-badseq-increment=<int|0xHEX>             ; badseq fooling seq signed increment for dup. default -10000
+ --dup-badack-increment=<int|0xHEX>             ; badseq fooling ackseq signed increment for dup. default -66000
+ --dup-start=[n|d|s]N                           ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
+ --dup-cutoff=[n|d|s]N                          ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
  --dpi-desync=[<mode0>,]<mode>[,<mode2>]        ; try to desync dpi state. modes : synack fake fakeknown rst rstack hopbyhop destopt ipfrag1 multisplit multidisorder fakedsplit fakeddisorder ipfrag2 udplen tamper
  --dpi-desync-fwmark=<int|0xHEX>                ; override fwmark for desync packet. default = 0x40000000 (1073741824)
  --dpi-desync-ttl=<int>                         ; set ttl for desync packet
  --dpi-desync-ttl6=<int>                        ; set ipv6 hop limit for desync packet. by default ttl value is used.
- --dpi-desync-autottl=[<delta>[:<min>[-<max>]]] ; auto ttl mode for both ipv4 and ipv6. default: 1:3-20
- --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]] ; overrides --dpi-desync-autottl for ipv6 only
+ --dpi-desync-autottl=[<delta>[:<min>[-<max>]]|-]  ; auto ttl mode for both ipv4 and ipv6. default: -1:3-20. "0:0-0" or "-" disables autottl.
+ --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]|-] ; overrides --dpi-desync-autottl for ipv6 only
  --dpi-desync-fooling=<mode>[,<mode>]           ; can use multiple comma separated values. modes : none md5sig ts badseq badsum datanoack hopbyhop hopbyhop2
  --dpi-desync-repeats=<N>                       ; send every desync packet N times
  --dpi-desync-skip-nosni=0|1                    ; 1(default)=do not act on ClientHello without SNI (ESNI ?)
@@ -169,11 +198,12 @@ nfqws takes the following parameters:
  --dpi-desync-fakedsplit-pattern=<filename>|0xHEX ; fake pattern for fakedsplit/fakeddisorder
  --dpi-desync-ipfrag-pos-tcp=<8..9216>          ; ip frag position starting from the transport header. multiple of 8, default 8.
  --dpi-desync-ipfrag-pos-udp=<8..9216>          ; ip frag position starting from the transport header. multiple of 8, default 32.
+ --dpi-desync-ts-increment=<int|0xHEX>          ; ts fooling TSval signed increment. default -600000
  --dpi-desync-badseq-increment=<int|0xHEX>      ; badseq fooling seq signed increment. default -10000
  --dpi-desync-badack-increment=<int|0xHEX>      ; badseq fooling ackseq signed increment. default -66000
  --dpi-desync-any-protocol=0|1                  ; 0(default)=desync only http and tls  1=desync any nonempty data packet
  --dpi-desync-fake-http=<filename>|0xHEX        ; file containing fake http request
- --dpi-desync-fake-tls=<filename>|0xHEX         ; file containing fake TLS ClientHello (for https)
+ --dpi-desync-fake-tls=<filename>|0xHEX|!       ; file containing fake TLS ClientHello (for https). '!' = standard fake
  --dpi-desync-fake-tls-mod=mod[,mod]            ; comma separated list of TLS fake mods. available mods : none,rnd,rndsni,sni=<sni>,dupsid,padencap
  --dpi-desync-fake-unknown=<filename>|0xHEX     ; file containing unknown protocol fake payload
  --dpi-desync-fake-syndata=<filename>|0xHEX     ; file containing SYN data payload
@@ -202,6 +232,7 @@ nfqws takes the following parameters:
  --filter-tcp=[~]port1[-port2]|*                ; TCP port filter. ~ means negation. setting tcp and not setting udp filter denies udp. comma separated list supported.
  --filter-udp=[~]port1[-port2]|*                ; UDP port filter. ~ means negation. setting udp and not setting tcp filter denies tcp. comma separated list supported.
  --filter-l7=<proto>                            ; L6-L7 protocol filter. multiple comma separated values allowed. proto: http tls quic wireguard dht discord stun unknown
+ --filter-ssid=ssid1[,ssid2,ssid3,...]          ; per profile wifi SSID filter
  --ipset=<filename>                             ; ipset include filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
  --ipset-ip=<ip_list>                           ; comma separated fixed subnet list
  --ipset-exclude=<filename>                     ; ipset exclude filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
@@ -257,10 +288,19 @@ Fakes are separate generated by nfqws packets carrying false information for DPI
 * **datanoack** sends tcp fakes without ACK flag. Servers do not accept this but DPI may accept.
   This mode may break NAT and may not work with iptables if masquerade is used, even from the router itself.
   Works with nftables properly. Likely requires external IP address (some ISPs pass these packets through their NAT).
-* **autottl** tries to automatically guess TTL value that allows DPI to receive fakes and does not allow them to reach the server.
-  This tech relies on well known TTL values used by OS : 64,128,255. nfqws takes first incoming packet (YES, you need to redirect it too),
-  guesses path length and decreases by `delta` value (default 1). If resulting value is outside the range (min,max - default 3,20)
-  then its normalized to min or max. If the path shorter than the value then autottl fails and falls back to the fixed value.
+* **ts** adds to TSval ts increment value (-600000 by default). Servers discard packets with TSval in some range.
+  Practical tests suggest increment between -100 and -0x80000000.
+  Timestamps are generated by client OS. In linux timestamps are enabled by default. In windows by default timestamps are disabled.
+  They can be enabled with this command : `netsh interface tcp set global timestamps=enabled` .
+  ts fooling requires that timestamps are enabled. They must be enabled on every client OS.
+  TSecr is left unmodified.
+* **autottl** tries to automatically guess hop count to the server and compute TTL by adding some delta value that can be positive or negative.
+  Positive deltas must be preceeded by unary `+` sign. Deltas without any unary sign are treated negative for old versions compatibility reasons.
+  This tech relies on well known TTL default values used by OS : 64,128,255.
+  nfqws needs first incoming packet to see it's TTL. You must redirect it too.
+  If resulting value TTL is outside the range (min,max) then its normalized to min or max.
+  If delta is negative and TTL is longer than guessed hop count or delta is positive and TTL is shorter than guessed hop count
+  then autottl fails and falls back to the fixed value.
   This can help if multiple DPIs exists on backbone channels, not just near the ISP.
   Can fail if inbound and outbound paths are not symmetric.
 
@@ -356,6 +396,44 @@ For example, `hopbyhop,multisplit` means split original tcp packet into several 
 With `hopbyhop,ipfrag2` header sequence will be : `ipv6,hop-by-hop,fragment,tcp/udp`.
 `ipfrag1` mode may not always work without special preparations. See "IP Fragmentation" notices.
 
+### Original modding
+
+Parameters `--orig-ttl` and `--orig-ttl6` allow to set TTL on original packets.
+All further packet manipulations, e.g. segmentation, take modded original as data source and inherit modded TTL.
+
+`--orig-autottl` and `--orig-autottl6` work the same way as `dpi-desync-autottl`, but on original packets.
+Delta should have unary `+` sign to produce TTL longer than guessed hop count. Otherwise nothing will reach the server.
+Example : `--orig-autottl=+5:3-64`.
+
+`--orig-mod-start` and `--orig-mod-cutoff` specify start and end conditions for original modding. The work the same way as
+`--dpi-desync-start` and `--dpi-desync-cutoff`.
+
+This function can be useful when DPI hunts for fakes and blocks suspicious connections.
+DPI can compute TTL difference between packets and fire block trigger if it exceedes some threshold.
+
+### Duplicates
+
+Duplicates are copies of original packets which are sent before them. Duplicates are enabled by `--dup=N`, where N is dup count.
+`--dup-replace` disables sending of original.
+
+Dups are sent only when original would also be sent without reconstruction.
+For example, if TCP segmentation happens, original is actually dropped and is being replaced by artificially constructed new packets.
+Dups are not sent in this case.
+
+All dup fooling modes are available : `--dup-ttl`. `--dup-ttl6`, `--dup-fooling`.
+You decide whether these packets need to reach the server and in what form, according to the intended strategy.
+
+`--dup-autottl` and `--dup-autottl6` work the same way as `dpi-desync-autottl`.
+Delta can be preceeded by unary `+` or `-` sign.
+Example : `--dup-autottl=-2:3-64`.
+
+`--dup-start` and `--dup-cutoff` specify start and end conditions for dupping. The work the same way as
+`--dpi-desync-start` and `--dpi-desync-cutoff`.
+
+This function can help if DPI compares some characteristics of fake and original packets and block connection if they differ some way.
+Fooled duplicates can convince DPI that the whole session has an anomaly.
+For example, all connection is protected by MD5 signature, not individual packets.
+
 ### Server reply reaction
 
 There are DPIs that analyze responses from the server, particularly the certificate from the ServerHello that contain domain name(s). The ClientHello delivery confirmation is an ACK packet from the server with ACK sequence number corresponding to the length of the ClientHello+1.
@@ -377,11 +455,25 @@ Without extra parameter payload is 16 zero bytes.
 
 `--dpi-desync` takes up to 3 comma separated modes.
 
-* 0 phase modes work during the connection establishement : `synack`, `syndata` `--wsize`, `--wssize`. [hostlist](((#multiple-strategies))) filters are not applicable.
+* 0 phase modes work during the connection establishement : `synack`, `syndata` `--wsize`, `--wssize`. [hostlist](#multiple-strategies) filters are applicable only if [`--ipcache-hostname`](#ip-cache) is enabled.
 * In the 1st phase fakes are sent before original data  : `fake`, `rst`, `rstack`.
 * In the 2nd phase original data is sent in a modified way (for example `fakedsplit` or `ipfrag2`).
 
 Modes must be specified in phase ascending order.
+
+### IP cache
+
+`ipcache` is the structure in the process memory that stores some information by IP address and interface name key.
+This information can be used as missing data. Currently it's used in the following cases :
+
+1. IP,interface => hop count . This is used to apply autottl at 0 phase since the first session packet. If the record is absent autottl will not be applied immediately. Second time it will be applied immediately using cached hop count.
+
+2. IP => hostname . Hostname is cached to be used in 0 phase strategies. Mode is disabled by default and can be enabled by `ipcache-hostname` parameter.
+This tech is experimental. There's no one-to-one correspondence between IP and domain name. Multiple domains can resolve to the same IP.
+If collision happens hostname is replaced. On CDNs a domain can resolve to different IPs over time. `--ipcache-lifetime` limits how long cached record is valid. It's 2 hours by default.
+Be prepared for unexpected results that can be explained only by reading debug logs.
+
+SIGUSR2 forces process to output it's ipcache to stdout.
 
 ### CONNTRACK
 
@@ -472,9 +564,9 @@ There is special support for all tcp split options for multi segment TLS. Split 
 ### UDP support
 
 UDP attacks are limited. Its not possible to fragment UDP on transport level, only on network (ip) level.
-Only desync modes `fake`,`hopbyhop`,`destopt`,`ipfrag1` and `ipfrag2` are applicable.
-`fake`,`hopbyhop`,`destopt` can be used in combo with `ipfrag2`.
-`fake` can be used in combo with `udplen` and `tamper`.
+Only desync modes `fake`,`fakeknown`,`hopbyhop`,`destopt`,`ipfrag1`,`ipfrag2`,`udplen` and `tamper` are applicable.
+`fake`,`fakeknown`,`hopbyhop`,`destopt`,`ipfrag1` are 1st phase modes, others - 2nd phase.
+As always it's possible to combine one mode from 1st phase with one mode from 2nd phase but not possible to mix same phase modes.
 
 `udplen` increases udp payload size by `--dpi-desync-udplen-increment` bytes. Padding is filled with zeroes by default but can be overriden with a pattern.
 This option can resist DPIs that track outgoing UDP packet sizes.
@@ -577,6 +669,30 @@ This way you may never unblock all resources and only confuse yourself.
 IMPORTANT : user-mode ipset implementation was not designed as a kernel version replacement. Kernel version is much more effective.
 It's for the systems that lack ipset support : Windows and Linux without nftables and ipset kernel modules (Android, for example).
 
+### WIFI filtering
+
+Wifi interface name is not related to connected SSID.
+It's possible to connect interface to different SSIDs.
+They may require different strategies. How to solve this problem ?
+
+You can run and stop nfqws instances manually. But you can also automate this.
+Windows version `winws` has global filter `--ssid-filter`.
+It connects or disconnects `winws` depending on connected SSIDs.
+Routing is not take into account. This approach is possible because windivert can have multiple handlers with intersecting filter.
+If SSID changes one `winws` connects and others disconnect.
+
+`winws` solution is hard to implement in Linux because one nfqueue can have only one handler and it's impossible to pass same traffic to multiple queues.
+One must connect when others have already disconnected.
+Instead, `nfqws` has per-profile `--filter-ssid` parameter. Like `--ssid-filter` it takes comma separated SSID list.
+`nfqws` maintains ifname->SSID list which is updated not faster than once a second.
+When a packet comes incoming or outgoing interface name is matched to the SSID and then used in profile selection algorithm.
+
+SSID info is taken the same way as `iw dev <ifname> info` does (nl80211).
+Unfortunately it's broken since kernel 5.19 and still unfixed in 6.14.
+In the latter case `iwgetid` way is used (wireless extensions).
+Wireless extensions are deprecated. Some kernels can be built without wext support.
+Before using `--filter-ssid` check that any of the mentioned commands can return SSID.
+
 ### Virtual machines
 
 Most of nfqws packet magic does not work from VMs powered by virtualbox and vmware when network is NATed.
@@ -669,6 +785,31 @@ In `iptables` flow offloading is controlled by openwrt proprietary extension `FL
 
 Flow offloading does not interfere with **tpws** and `OUTPUT` traffic. It only breaks nfqws that fools `FORWARD` traffic.
 
+### Server side fooling
+
+It's also possible.
+nfqws is intended for client side attacks. That's why it recognizes direct and reply traffic based on role in connection establishement.
+If it sees SYN then source IP is client IP. If it sees SYN,ACK then source ip is server IP.
+For UDP client address is considered as source IP of the first seen packet of src_ip,src_port,dst_ip,dst_port tuple.
+
+This does not work correctly on the server side. Client traffic is reply traffic, server traffic is direct traffic.
+
+`--wsize` works in any case. It can be used on both client and server.
+Other techs work only if nfqws treats traffic as direct traffic.
+To apply them to server originated traffic disable conntrack by `--ctrack-disable` parameter.
+If a packet is not found in conntrack it's treated as direct and techs like `multidisorder` will be applied.
+
+Most of the protocols will not be recognized because protocol recognition system only reacts to client packets.
+To make things working use `--dpi-desync-any-protocol` with connbytes or packet payload limiter.
+start/cutoff are unavailable because they are conntrack based.
+
+`--synack-split` removes standard SYN,ACK packet and replaces it with one SYN packet, SYN then ACK separate packets or ACK then SYN separate packets.
+Client sends SYN,ACK in reply which usually only server does.
+This makes some DPI's to treat connection establishement roles wrong. They stop to block.
+See [split handshake](https://nmap.org/misc/split-handshake.pdf).
+
+On server side traffic should be redirected to nfqws using source port numbers and original connbytes direction.
+
 
 ## tpws
 
@@ -705,6 +846,8 @@ tpws is transparent proxy.
  --local-tcp-user-timeout=<seconds>      ; set tcp user timeout for local leg (default : 10, 0 = system default)
  --remote-tcp-user-timeout=<seconds>     ; set tcp user timeout for remote leg (default : 20, 0 = system default)
  --fix-seg=<int>                         ; recover failed TCP segmentation at the cost of slowdown. wait up to N msec.
+ --ipcache-lifetime=<int>                ; time in seconds to keep cached domain name (default 7200). 0 = no expiration
+ --ipcache-hostname=[0|1]                ; 1 or no argument enables ip->hostname caching
  --no-resolve                            ; disable socks5 remote dns
  --resolver-threads=<int>                ; number of resolver worker threads
  --maxconn=<max_connections>             ; max number of local legs
@@ -755,7 +898,7 @@ tpws is transparent proxy.
  --daemon                                ; daemonize
  --pidfile=<filename>                    ; write pid to file
  --user=<username>                       ; drop root privs
- --uid=uid[:gid]                         ; drop root privs
+ --uid=uid[:gid1,gid2,...]               ; drop root privs
 ```
 
 ### TCP segmentation in tpws
@@ -789,7 +932,7 @@ If you're attempting to split massive transmission with `--split-any-protocol` o
 `--mss` sets TCP_MAXSEG socket option. Client sets this value in MSS TCP option in the SYN packet.
 Server replies with it's own MSS in SYN,ACK packet. Usually servers lower their packet sizes but they still don't fit to supplied MSS. The greater MSS client sets the bigger server's packets will be.
 If it's enough to split TLS 1.2 ServerHello, it may fool DPI that checks certificate domain name.
-This scheme may significantly lower speed. Hostlist filter is possible only in socks mode if client uses remote resolving (firefox `network.proxy.socks_remote_dns`).
+This scheme may significantly lower speed. Hostlist filter is possible only in socks mode if client uses remote resolving (firefox `network.proxy.socks_remote_dns`) or if `ipcache-hostname` is enabled.
 `--mss` is not required for TLS1.3. If TLS1.3 is negotiable then MSS make things only worse. Use only if nothing better is available. Works only in Linux, not BSD or MacOS.
 
 ### Other tamper options
@@ -1090,6 +1233,23 @@ Don't use `<HOSTLIST>` in highly specialized profiles. Use your own filter or ho
 `<HOSTLIST_NOAUTO>` marker uses standard autohostlist as usual hostlist thus disabling auto additions in this profile.
 If any other profile adds something this profile accepts the change automatically.
 
+Change loop prevention mark bit
+
+`DESYNC_MARK=0x40000000`
+
+Change postnat scheme mark bit
+
+`DESYNC_MARK_POSTNAT=0x20000000`
+
+If uncommented pass to zapret only packets marked with this bit
+
+`#FILTER_MARK_POSTNAT=0x10000000`
+
+Bit must be set in your own rules.
+* iptables - in mangle PREROUTING and mangle OUTPUT before zapret rules (iptables -I _after_ zapret rules application).
+* nftables - in output and prerouting hooks with priority -102 or lower.
+
+Mark criterias can be any. For example, source IP or source interface name.
 
 **tpws** socks proxy mode switch
 
@@ -1269,6 +1429,10 @@ The `INIT_APPLY_FW=1` parameter enables the init script to independently apply i
 With other values or if the parameter is commented out, the rules will not be applied.
 This is useful if you have a firewall management system, in the settings of which you should tie the rules.
 Not applicable to `OpenWRT` if used with `firewall3+iptables`.
+
+`FILTER_TTL_EXPIRED_ICMP=1` blocks icmp time exceeded messages in response to connections handled by nfqws.
+Linux closes socket if it receives this icmp in response to SYN packet. Similar mechanism exists for datagram sockets.
+It's better to disable this if you do not expect problems caused by icmp.
 
 The following settings are not relevant for openwrt :
 

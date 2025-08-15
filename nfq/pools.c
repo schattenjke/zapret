@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 
 #define DESTROY_STR_POOL(etype, ppool) \
 	etype *elem, *tmp; \
@@ -11,7 +12,7 @@
 		HASH_DEL(*ppool, elem); \
 		free(elem); \
 	}
-	
+
 #define ADD_STR_POOL(etype, ppool, keystr, keystr_len) \
 	etype *elem; \
 	if (!(elem = (etype*)malloc(sizeof(etype)))) \
@@ -24,7 +25,7 @@
 	memcpy(elem->str, keystr, keystr_len); \
 	elem->str[keystr_len] = 0; \
 	oom = false; \
-	HASH_ADD_KEYPTR(hh, *ppool, elem->str, strlen(elem->str), elem); \
+	HASH_ADD_KEYPTR(hh, *ppool, elem->str, keystr_len, elem); \
 	if (oom) \
 	{ \
 		free(elem->str); \
@@ -32,9 +33,12 @@
 		return false; \
 	}
 #define ADD_HOSTLIST_POOL(etype, ppool, keystr, keystr_len, flg) \
-	ADD_STR_POOL(etype,ppool,keystr,keystr_len); \
-	elem->flags = flg;
-
+	etype *elem_find; \
+	HASH_FIND(hh, *ppool, keystr, keystr_len, elem_find); \
+	if (!elem_find) { \
+		ADD_STR_POOL(etype,ppool,keystr,keystr_len); \
+		elem->flags = flg; \
+	}
 
 #undef uthash_nonfatal_oom
 #define uthash_nonfatal_oom(elt) ut_oom_recover(elt)
@@ -158,6 +162,19 @@ void strlist_destroy(struct str_list_head *head)
 		strlist_entry_destroy(entry);
 	}
 }
+bool strlist_search(const struct str_list_head *head, const char *str)
+{
+	struct str_list *entry;
+	if (str)
+	{
+		LIST_FOREACH(entry, head, next)
+		{
+			if (!strcmp(entry->str, str))
+				return true;
+		}
+	}
+	return false;
+}
 
 
 
@@ -259,121 +276,146 @@ bool hostlist_collection_is_empty(const struct hostlist_collection_head *head)
 }
 
 
-void ipset4Destroy(ipset4 **ipset)
+static int kavl_bit_cmp(const struct kavl_bit_elem *p, const struct kavl_bit_elem *q)
 {
-	ipset4 *elem, *tmp;
-	HASH_ITER(hh, *ipset, elem, tmp)
+	unsigned int bitlen = q->bitlen < p->bitlen ? q->bitlen : p->bitlen;
+	unsigned int df = bitlen & 7, bytes = bitlen >> 3;
+	int cmp = memcmp(p->data, q->data, bytes);
+
+	if (cmp || !df) return cmp;
+
+	uint8_t c1 = p->data[bytes] >> (8 - df);
+	uint8_t c2 = q->data[bytes] >> (8 - df);
+	return c1<c2 ? -1 : c1==c2 ? 0 : 1;
+}
+KAVL_INIT(kavl_bit, struct kavl_bit_elem, head, kavl_bit_cmp)
+static void kavl_bit_destroy_elem(struct kavl_bit_elem *e)
+{
+	if (e)
 	{
-		HASH_DEL(*ipset, elem);
-		free(elem);
+		free(e->data);
+		free(e);
 	}
 }
-bool ipset4Check(ipset4 *ipset, const struct in_addr *a, uint8_t preflen)
+void kavl_bit_delete(struct kavl_bit_elem **hdr, const void *data, unsigned int bitlen)
 {
-	uint32_t ip = ntohl(a->s_addr);
-	struct cidr4 cidr;
-	ipset4 *ips_found;
-
-	// zero alignment bytes
-	memset(&cidr,0,sizeof(cidr));
-	cidr.preflen = preflen+1;
-	do
-	{
-		cidr.preflen--;
-		cidr.addr.s_addr = htonl(ip & mask_from_preflen(cidr.preflen));
-		HASH_FIND(hh, ipset, &cidr, sizeof(cidr), ips_found);
-		if (ips_found) return true;
-	} while(cidr.preflen);
-
-	return false;
+	struct kavl_bit_elem temp = {
+		.bitlen = bitlen, .data = (uint8_t*)data
+	};
+	kavl_bit_destroy_elem(kavl_erase(kavl_bit, hdr, &temp, 0));
 }
-bool ipset4Add(ipset4 **ipset, const struct in_addr *a, uint8_t preflen)
+void kavl_bit_destroy(struct kavl_bit_elem **hdr)
+{
+	while (*hdr)
+	{
+		struct kavl_bit_elem *e = kavl_erase_first(kavl_bit, hdr);
+		if (!e)	break;
+		kavl_bit_destroy_elem(e);
+	}
+	free(*hdr);
+}
+struct kavl_bit_elem *kavl_bit_add(struct kavl_bit_elem **hdr, void *data, unsigned int bitlen, size_t struct_size)
+{
+	if (!struct_size) struct_size=sizeof(struct kavl_bit_elem);
+
+	struct kavl_bit_elem *v, *e = calloc(1, struct_size);
+	if (!e) return 0;
+
+	e->bitlen = bitlen;
+	e->data = data;
+
+	v = kavl_insert(kavl_bit, hdr, e, 0);
+	while (e != v && e->bitlen < v->bitlen)
+	{
+		kavl_bit_delete(hdr, v->data, v->bitlen);
+		v = kavl_insert(kavl_bit, hdr, e, 0);
+	}
+	if (e != v) kavl_bit_destroy_elem(e);
+	return v;
+}
+struct kavl_bit_elem *kavl_bit_get(const struct kavl_bit_elem *hdr, const void *data, unsigned int bitlen)
+{
+	struct kavl_bit_elem temp = {
+		.bitlen = bitlen, .data = (uint8_t*)data
+	};
+	return kavl_find(kavl_bit, hdr, &temp, 0);
+}
+
+static bool ipset_kavl_add(struct kavl_bit_elem **ipset, const void *a, uint8_t preflen)
+{
+	uint8_t bytelen = (preflen+7)>>3;
+	uint8_t *abuf = malloc(bytelen);
+	if (!abuf) return false;
+	memcpy(abuf,a,bytelen);
+	if (!kavl_bit_add(ipset,abuf,preflen,0))
+	{
+		free(abuf);
+		return false;
+	}
+	return true;
+}
+
+
+bool ipset4Check(const struct kavl_bit_elem *ipset, const struct in_addr *a, uint8_t preflen)
+{
+	return !!kavl_bit_get(ipset,a,preflen);
+}
+bool ipset4Add(struct kavl_bit_elem **ipset, const struct in_addr *a, uint8_t preflen)
 {
 	if (preflen>32) return false;
-
-	// avoid dups
-	if (ipset4Check(*ipset, a, preflen)) return true; // already included
-
-	struct ipset4 *entry = calloc(1,sizeof(ipset4));
-	if (!entry) return false;
-
-	entry->cidr.addr.s_addr = htonl(ntohl(a->s_addr) & mask_from_preflen(preflen));
-	entry->cidr.preflen = preflen;
-	oom = false;
-	HASH_ADD(hh, *ipset, cidr, sizeof(entry->cidr), entry);
-	if (oom) { free(entry); return false; }
-
-	return true;
+	return ipset_kavl_add(ipset,a,preflen);
 }
-void ipset4Print(ipset4 *ipset)
+void ipset4Print(struct kavl_bit_elem *ipset)
 {
-	ipset4 *ips, *tmp;
-	HASH_ITER(hh, ipset , ips, tmp)
-	{
-		print_cidr4(&ips->cidr);
-		printf("\n");
-	}
-}
+	if (!ipset) return;
 
-void ipset6Destroy(ipset6 **ipset)
-{
-	ipset6 *elem, *tmp;
-	HASH_ITER(hh, *ipset, elem, tmp)
-	{
-		HASH_DEL(*ipset, elem);
-		free(elem);
-	}
-}
-bool ipset6Check(ipset6 *ipset, const struct in6_addr *a, uint8_t preflen)
-{
-	struct cidr6 cidr;
-	ipset6 *ips_found;
-
-	// zero alignment bytes
-	memset(&cidr,0,sizeof(cidr));
-	cidr.preflen = preflen+1;
+	struct cidr4 c;
+	const struct kavl_bit_elem *elem;
+	kavl_itr_t(kavl_bit) itr;
+	kavl_itr_first(kavl_bit, ipset, &itr);
 	do
 	{
-		cidr.preflen--;
-		ip6_and(a, mask_from_preflen6(cidr.preflen), &cidr.addr);
-		HASH_FIND(hh, ipset, &cidr, sizeof(cidr), ips_found);
-		if (ips_found) return true;
-	} while(cidr.preflen);
-
-	return false;
-}
-bool ipset6Add(ipset6 **ipset, const struct in6_addr *a, uint8_t preflen)
-{
-	if (preflen>128) return false;
-
-	// avoid dups
-	if (ipset6Check(*ipset, a, preflen)) return true; // already included
-
-	struct ipset6 *entry = calloc(1,sizeof(ipset6));
-	if (!entry) return false;
-
-	ip6_and(a, mask_from_preflen6(preflen), &entry->cidr.addr);
-	entry->cidr.preflen = preflen;
-	oom = false;
-	HASH_ADD(hh, *ipset, cidr, sizeof(entry->cidr), entry);
-	if (oom) { free(entry); return false; }
-
-	return true;
-}
-void ipset6Print(ipset6 *ipset)
-{
-	ipset6 *ips, *tmp;
-	HASH_ITER(hh, ipset , ips, tmp)
-	{
-		print_cidr6(&ips->cidr);
+		elem = kavl_at(&itr);
+		c.preflen = elem->bitlen;
+		expand_bits(&c.addr, elem->data, elem->bitlen, sizeof(c.addr));
+		print_cidr4(&c);
 		printf("\n");
 	}
+	while (kavl_itr_next(kavl_bit, &itr));
+}
+
+bool ipset6Check(const struct kavl_bit_elem *ipset, const struct in6_addr *a, uint8_t preflen)
+{
+	return !!kavl_bit_get(ipset,a,preflen);
+}
+bool ipset6Add(struct kavl_bit_elem **ipset, const struct in6_addr *a, uint8_t preflen)
+{
+	if (preflen>128) return false;
+	return ipset_kavl_add(ipset,a,preflen);
+}
+void ipset6Print(struct kavl_bit_elem *ipset)
+{
+	if (!ipset) return;
+
+	struct cidr6 c;
+	const struct kavl_bit_elem *elem;
+	kavl_itr_t(kavl_bit) itr;
+	kavl_itr_first(kavl_bit, ipset, &itr);
+	do
+	{
+		elem = kavl_at(&itr);
+		c.preflen = elem->bitlen;
+		expand_bits(&c.addr, elem->data, elem->bitlen, sizeof(c.addr));
+		print_cidr6(&c);
+		printf("\n");
+	}
+	while (kavl_itr_next(kavl_bit, &itr));
 }
 
 void ipsetDestroy(ipset *ipset)
 {
-	ipset4Destroy(&ipset->ips4);
-	ipset6Destroy(&ipset->ips6);
+	kavl_bit_destroy(&ipset->ips4);
+	kavl_bit_destroy(&ipset->ips6);
 }
 void ipsetPrint(ipset *ipset)
 {
@@ -549,7 +591,7 @@ struct blob_item *blob_collection_add_blob(struct blob_collection_head *head, co
 	if (data) memcpy(entry->data,data,size);
 	entry->size = size;
 	entry->size_buf = size+size_reserve;
-	
+
 	// insert to the end
 	struct blob_item *itemc,*iteml=LIST_FIRST(head);
 	if (iteml)
@@ -579,3 +621,220 @@ bool blob_collection_empty(const struct blob_collection_head *head)
 {
 	return !LIST_FIRST(head);
 }
+
+
+
+static void ipcache_item_touch(ip_cache_item *item)
+{
+	time(&item->last);
+}
+static void ipcache_item_init(ip_cache_item *item)
+{
+	ipcache_item_touch(item);
+	item->hostname = NULL;
+	item->hostname_is_ip = false;
+	item->hops = 0;
+}
+static void ipcache_item_destroy(ip_cache_item *item)
+{
+	free(item->hostname);
+}
+
+static void ipcache4Destroy(ip_cache4 **ipcache)
+{
+	ip_cache4 *elem, *tmp;
+	HASH_ITER(hh, *ipcache, elem, tmp)
+	{
+		HASH_DEL(*ipcache, elem);
+		ipcache_item_destroy(&elem->data);
+		free(elem);
+	}
+}
+static void ipcache4Key(ip4if *key, const struct in_addr *a, const char *iface)
+{
+	memset(key,0,sizeof(*key)); // make sure everything is zero
+	key->addr = *a;
+	if (iface) snprintf(key->iface,sizeof(key->iface),"%s",iface);
+}
+static ip_cache4 *ipcache4Find(ip_cache4 *ipcache, const struct in_addr *a, const char *iface)
+{
+	ip_cache4 *entry;
+	struct ip4if key;
+
+	ipcache4Key(&key,a,iface);
+	HASH_FIND(hh, ipcache, &key, sizeof(key), entry);
+	return entry;
+}
+static ip_cache4 *ipcache4Add(ip_cache4 **ipcache, const struct in_addr *a, const char *iface)
+{
+	// avoid dups
+	ip_cache4 *entry = ipcache4Find(*ipcache,a,iface);
+	if (entry) return entry; // already included
+
+	entry = malloc(sizeof(ip_cache4));
+	if (!entry) return NULL;
+	ipcache4Key(&entry->key,a,iface);
+
+	oom = false;
+	HASH_ADD(hh, *ipcache, key, sizeof(entry->key), entry);
+	if (oom) { free(entry); return NULL; }
+
+	ipcache_item_init(&entry->data);
+
+	return entry;
+}
+static void ipcache4Print(ip_cache4 *ipcache)
+{
+	char s_ip[16];
+	time_t now;
+	ip_cache4 *ipc, *tmp;
+
+	time(&now);
+	HASH_ITER(hh, ipcache , ipc, tmp)
+	{
+		*s_ip=0;
+		inet_ntop(AF_INET, &ipc->key.addr, s_ip, sizeof(s_ip));
+		printf("%s iface=%s : hops %u hostname=%s hostname_is_ip=%u now=last+%llu\n", s_ip, ipc->key.iface, ipc->data.hops, ipc->data.hostname ? ipc->data.hostname : "", ipc->data.hostname_is_ip, (unsigned long long)(now-ipc->data.last));
+	}
+}
+
+static void ipcache6Destroy(ip_cache6 **ipcache)
+{
+	ip_cache6 *elem, *tmp;
+	HASH_ITER(hh, *ipcache, elem, tmp)
+	{
+		HASH_DEL(*ipcache, elem);
+		ipcache_item_destroy(&elem->data);
+		free(elem);
+	}
+}
+static void ipcache6Key(ip6if *key, const struct in6_addr *a, const char *iface)
+{
+	memset(key,0,sizeof(*key)); // make sure everything is zero
+	key->addr = *a;
+	if (iface) snprintf(key->iface,sizeof(key->iface),"%s",iface);
+}
+static ip_cache6 *ipcache6Find(ip_cache6 *ipcache, const struct in6_addr *a, const char *iface)
+{
+	ip_cache6 *entry;
+	ip6if key;
+
+	ipcache6Key(&key,a,iface);
+	HASH_FIND(hh, ipcache, &key, sizeof(key), entry);
+	return entry;
+}
+static ip_cache6 *ipcache6Add(ip_cache6 **ipcache, const struct in6_addr *a, const char *iface)
+{
+	// avoid dups
+	ip_cache6 *entry = ipcache6Find(*ipcache,a,iface);
+	if (entry) return entry; // already included
+
+	entry = malloc(sizeof(ip_cache6));
+	if (!entry) return NULL;
+	ipcache6Key(&entry->key,a,iface);
+
+	oom = false;
+	HASH_ADD(hh, *ipcache, key, sizeof(entry->key), entry);
+	if (oom) { free(entry); return NULL; }
+
+	ipcache_item_init(&entry->data);
+
+	return entry;
+}
+static void ipcache6Print(ip_cache6 *ipcache)
+{
+	char s_ip[40];
+	time_t now;
+	ip_cache6 *ipc, *tmp;
+
+	time(&now);
+	HASH_ITER(hh, ipcache , ipc, tmp)
+	{
+		*s_ip=0;
+		inet_ntop(AF_INET6, &ipc->key.addr, s_ip, sizeof(s_ip));
+		printf("%s iface=%s : hops %u hostname=%s hostname_is_ip=%u now=last+%llu\n", s_ip, ipc->key.iface, ipc->data.hops, ipc->data.hostname ? ipc->data.hostname : "", ipc->data.hostname_is_ip, (unsigned long long)(now-ipc->data.last));
+	}
+}
+
+void ipcacheDestroy(ip_cache *ipcache)
+{
+	ipcache4Destroy(&ipcache->ipcache4);
+	ipcache6Destroy(&ipcache->ipcache6);
+}
+void ipcachePrint(ip_cache *ipcache)
+{
+	ipcache4Print(ipcache->ipcache4);
+	ipcache6Print(ipcache->ipcache6);
+}
+
+ip_cache_item *ipcacheTouch(ip_cache *ipcache, const struct in_addr *a4, const struct in6_addr *a6, const char *iface)
+{
+	ip_cache4 *ipcache4;
+	ip_cache6 *ipcache6;
+	if (a4)
+	{
+		if ((ipcache4 = ipcache4Add(&ipcache->ipcache4,a4,iface)))
+		{
+			ipcache_item_touch(&ipcache4->data);
+			return &ipcache4->data;
+		}
+	}
+	else if (a6)
+	{
+		if ((ipcache6 = ipcache6Add(&ipcache->ipcache6,a6,iface)))
+		{
+			ipcache_item_touch(&ipcache6->data);
+			return &ipcache6->data;
+		}
+	}
+	return NULL;
+}
+
+static void ipcache4_purge(ip_cache4 **ipcache, time_t lifetime)
+{
+	ip_cache4 *elem, *tmp;
+	time_t now = time(NULL);
+	HASH_ITER(hh, *ipcache, elem, tmp)
+	{
+		if (now >= (elem->data.last + lifetime))
+		{
+			HASH_DEL(*ipcache, elem);
+			ipcache_item_destroy(&elem->data);
+			free(elem);
+		}
+	}
+}
+static void ipcache6_purge(ip_cache6 **ipcache, time_t lifetime)
+{
+	ip_cache6 *elem, *tmp;
+	time_t now = time(NULL);
+	HASH_ITER(hh, *ipcache, elem, tmp)
+	{
+		if (now >= (elem->data.last + lifetime))
+		{
+			HASH_DEL(*ipcache, elem);
+			ipcache_item_destroy(&elem->data);
+			free(elem);
+		}
+	}
+}
+static void ipcache_purge(ip_cache *ipcache, time_t lifetime)
+{
+	if (lifetime) // 0 = no expire
+	{
+		ipcache4_purge(&ipcache->ipcache4, lifetime);
+		ipcache6_purge(&ipcache->ipcache6, lifetime);
+	}
+}
+static time_t ipcache_purge_prev=0;
+void ipcachePurgeRateLimited(ip_cache *ipcache, time_t lifetime)
+{
+	time_t now = time(NULL);
+	// do not purge too often to save resources
+	if (ipcache_purge_prev != now)
+	{
+		ipcache_purge(ipcache, lifetime);
+		ipcache_purge_prev = now;
+	}
+}
+

@@ -7,6 +7,7 @@
 #include "ipset.h"
 #include "protocol.h"
 #include "helpers.h"
+#include "pools.h"
 
 #define PKTDATA_MAXDUMP 32
 
@@ -90,7 +91,54 @@ static void TLSDebug(const uint8_t *tls,size_t sz)
 	TLSDebugHandshake(tls+5,sz-5);
 }
 
-static bool dp_match(struct desync_profile *dp, const struct sockaddr *dest, const char *hostname, t_l7proto l7proto)
+bool ipcache_put_hostname(const struct in_addr *a4, const struct in6_addr *a6, const char *hostname, bool hostname_is_ip)
+{
+	if (!params.cache_hostname) return true;
+
+	ip_cache_item *ipc = ipcacheTouch(&params.ipcache,a4,a6);
+	if (!ipc)
+	{
+		DLOG_ERR("ipcache_put_hostname: out of memory\n");
+		return false;
+	}
+	if (!ipc->hostname || strcmp(ipc->hostname,hostname))
+	{
+		free(ipc->hostname);
+		if (!(ipc->hostname = strdup(hostname)))
+		{
+			DLOG_ERR("ipcache_put_hostname: out of memory\n");
+			return false;
+		}
+		ipc->hostname_is_ip = hostname_is_ip;
+		VPRINT("hostname cached (is_ip=%u): %s\n", hostname_is_ip, hostname);
+	}
+	return true;
+}
+static bool ipcache_get_hostname(const struct in_addr *a4, const struct in6_addr *a6, char *hostname, size_t hostname_buf_len, bool *hostname_is_ip)
+{
+	if (!params.cache_hostname)
+	{
+		*hostname = 0;
+		return true;
+	}
+	ip_cache_item *ipc = ipcacheTouch(&params.ipcache,a4,a6);
+	if (!ipc)
+	{
+		DLOG_ERR("ipcache_get_hostname: out of memory\n");
+		return false;
+	}
+	if (ipc->hostname)
+	{
+		VPRINT("got cached hostname (is_ip=%u): %s\n", ipc->hostname_is_ip, ipc->hostname);
+		snprintf(hostname,hostname_buf_len,"%s",ipc->hostname);
+		if (hostname_is_ip) *hostname_is_ip = ipc->hostname_is_ip;
+	}
+	else
+		*hostname = 0;
+	return true;
+}
+
+static bool dp_match(struct desync_profile *dp, const struct sockaddr *dest, const char *hostname, bool bNoSubdom, t_l7proto l7proto)
 {
 	bool bHostlistsEmpty;
 
@@ -121,11 +169,11 @@ static bool dp_match(struct desync_profile *dp, const struct sockaddr *dest, con
 		return true;
 	else if (hostname)
 		// if hostlists are present profile matches only if hostname is known and satisfy profile hostlists
-		return HostlistCheck(dp, hostname, NULL, true);
+		return HostlistCheck(dp, hostname, bNoSubdom, NULL, true);
 
 	return false;
 }
-static struct desync_profile *dp_find(struct desync_profile_list_head *head, const struct sockaddr *dest, const char *hostname, t_l7proto l7proto)
+static struct desync_profile *dp_find(struct desync_profile_list_head *head, const struct sockaddr *dest, const char *hostname, bool bNoSubdom, t_l7proto l7proto)
 {
 	struct desync_profile_list *dpl;
 	if (params.debug)
@@ -136,7 +184,7 @@ static struct desync_profile *dp_find(struct desync_profile_list_head *head, con
 	}
 	LIST_FOREACH(dpl, head, next)
 	{
-		if (dp_match(&dpl->dp,dest,hostname,l7proto))
+		if (dp_match(&dpl->dp,dest,hostname,bNoSubdom,l7proto))
 		{
 			VPRINT("desync profile %d matches\n",dpl->dp.n);
 			return &dpl->dp;
@@ -145,9 +193,18 @@ static struct desync_profile *dp_find(struct desync_profile_list_head *head, con
 	VPRINT("desync profile not found\n");
 	return NULL;
 }
+
 void apply_desync_profile(t_ctrack *ctrack, const struct sockaddr *dest)
 {
-	ctrack->dp = dp_find(&params.desync_profiles, dest, ctrack->hostname, ctrack->l7proto);
+	ipcachePurgeRateLimited(&params.ipcache, params.ipcache_lifetime);
+	if (!ctrack->hostname)
+	{
+		char host[256];
+		if (ipcache_get_hostname(dest->sa_family==AF_INET ? &((struct sockaddr_in*)dest)->sin_addr : NULL, dest->sa_family==AF_INET6 ? &((struct sockaddr_in6*)dest)->sin6_addr : NULL , host, sizeof(host), &ctrack->hostname_is_ip) && *host)
+			if (!(ctrack->hostname=strdup(host)))
+				DLOG_ERR("hostname dup : out of memory");
+	}
+	ctrack->dp = dp_find(&params.desync_profiles, dest, ctrack->hostname, ctrack->hostname_is_ip, ctrack->l7proto);
 }
 
 
@@ -158,7 +215,7 @@ void tamper_out(t_ctrack *ctrack, const struct sockaddr *dest, uint8_t *segment,
 	uint8_t *p, *pp, *pHost = NULL;
 	size_t method_len = 0, pos, tpos, orig_size=*size;
 	const char *method;
-	bool bHaveHost = false;
+	bool bHaveHost = false, bHostIsIp = false;
 	char *pc, Host[256];
 	t_l7proto l7proto;
 
@@ -215,7 +272,12 @@ void tamper_out(t_ctrack *ctrack, const struct sockaddr *dest, uint8_t *segment,
 	}
 
 	if (bHaveHost)
+	{
+		bHostIsIp = strip_host_to_ip(Host);
 		VPRINT("request hostname: %s\n", Host);
+		if (!ipcache_put_hostname(dest->sa_family==AF_INET ? &((struct sockaddr_in*)dest)->sin_addr : NULL, dest->sa_family==AF_INET6 ? &((struct sockaddr_in6*)dest)->sin6_addr : NULL , Host, bHostIsIp))
+			DLOG_ERR("ipcache_put_hostname: out of memory");
+	}
 
 	bool bDiscoveredL7 = ctrack->l7proto==UNKNOWN && l7proto!=UNKNOWN;
 	if (bDiscoveredL7)
@@ -224,15 +286,18 @@ void tamper_out(t_ctrack *ctrack, const struct sockaddr *dest, uint8_t *segment,
 		ctrack->l7proto=l7proto;
 	}
 
-	bool bDiscoveredHostname = bHaveHost && !ctrack->hostname;
+	bool bDiscoveredHostname = bHaveHost && !ctrack->hostname_discovered;
 	if (bDiscoveredHostname)
 	{
 		VPRINT("discovered hostname\n");
+		free(ctrack->hostname);
 		if (!(ctrack->hostname=strdup(Host)))
 		{
 			DLOG_ERR("strdup hostname : out of memory\n");
 			return;
 		}
+		ctrack->hostname_is_ip = bHostIsIp;
+		ctrack->hostname_discovered = true;
 	}
 
 	if (bDiscoveredL7 || bDiscoveredHostname)
@@ -251,7 +316,7 @@ void tamper_out(t_ctrack *ctrack, const struct sockaddr *dest, uint8_t *segment,
 		if (bHaveHost && !ctrack->b_host_checked)
 		{
 			bool bHostExcluded;
-			ctrack->b_host_matches = HostlistCheck(ctrack->dp, Host, &bHostExcluded, false);
+			ctrack->b_host_matches = HostlistCheck(ctrack->dp, Host, bHostIsIp, &bHostExcluded, false);
 			ctrack->b_host_checked = true;
 			if (!ctrack->b_host_matches)
 				ctrack->b_ah_check = !bHostExcluded;
@@ -481,7 +546,7 @@ static void auto_hostlist_reset_fail_counter(struct desync_profile *dp, const ch
 	}
 }
 
-static void auto_hostlist_failed(struct desync_profile *dp, const char *hostname, const char *client_ip_port, t_l7proto l7proto)
+static void auto_hostlist_failed(struct desync_profile *dp, const char *hostname, bool bNoSubdom, const char *client_ip_port, t_l7proto l7proto)
 {
 	hostfail_pool *fail_counter;
 
@@ -505,7 +570,7 @@ static void auto_hostlist_failed(struct desync_profile *dp, const char *hostname
 		
 		VPRINT("auto hostlist (profile %d) : rechecking %s to avoid duplicates\n", dp->n, hostname);
 		bool bExcluded=false;
-		if (!HostlistCheck(dp, hostname, &bExcluded, false) && !bExcluded)
+		if (!HostlistCheck(dp, hostname, bNoSubdom, &bExcluded, false) && !bExcluded)
 		{
 			VPRINT("auto hostlist (profile %d) : adding %s to %s\n", dp->n, hostname, dp->hostlist_auto->filename);
 			HOSTLIST_DEBUGLOG_APPEND("%s : profile %d : client %s : proto %s : adding to %s", hostname, dp->n, client_ip_port, l7proto_str(l7proto), dp->hostlist_auto->filename);
@@ -565,7 +630,7 @@ void tamper_in(t_ctrack *ctrack, const struct sockaddr *client, uint8_t *segment
 				// received not http reply. do not monitor this connection anymore
 				VPRINT("incoming unknown HTTP data detected for hostname %s\n", ctrack->hostname);
 			}
-			if (bFail) auto_hostlist_failed(ctrack->dp, ctrack->hostname, client_ip_port, ctrack->l7proto);
+			if (bFail) auto_hostlist_failed(ctrack->dp, ctrack->hostname, ctrack->hostname_is_ip, client_ip_port, ctrack->l7proto);
 		}
 		if (!bFail) auto_hostlist_reset_fail_counter(ctrack->dp, ctrack->hostname, client_ip_port, ctrack->l7proto);
 	}
@@ -590,7 +655,7 @@ void rst_in(t_ctrack *ctrack, const struct sockaddr *client)
 		{
 			VPRINT("incoming RST detected for hostname %s\n", ctrack->hostname);
 			HOSTLIST_DEBUGLOG_APPEND("%s : profile %d : client %s : proto %s : incoming RST", ctrack->hostname, ctrack->dp->n, client_ip_port, l7proto_str(ctrack->l7proto));
-			auto_hostlist_failed(ctrack->dp, ctrack->hostname, client_ip_port, ctrack->l7proto);
+			auto_hostlist_failed(ctrack->dp, ctrack->hostname, ctrack->hostname_is_ip, client_ip_port, ctrack->l7proto);
 		}
 	}
 }
@@ -613,7 +678,7 @@ void hup_out(t_ctrack *ctrack, const struct sockaddr *client)
 			// local leg dropped connection after first request. probably due to timeout.
 			VPRINT("local leg closed connection after first request (timeout ?). hostname: %s\n", ctrack->hostname);
 			HOSTLIST_DEBUGLOG_APPEND("%s : profile %d : client %s : proto %s : client closed connection without server reply", ctrack->hostname, ctrack->dp->n, client_ip_port, l7proto_str(ctrack->l7proto));
-			auto_hostlist_failed(ctrack->dp, ctrack->hostname, client_ip_port, ctrack->l7proto);
+			auto_hostlist_failed(ctrack->dp, ctrack->hostname, ctrack->hostname_is_ip, client_ip_port, ctrack->l7proto);
 		}
 	}
 }

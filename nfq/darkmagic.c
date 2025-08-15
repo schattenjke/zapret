@@ -29,6 +29,16 @@
 
 #endif
 
+#ifdef __linux__
+#include <linux/nl80211.h>
+#include <linux/genetlink.h>
+#include <libmnl/libmnl.h>
+#include <net/if.h>
+#define _LINUX_IF_H // prevent conflict between linux/if.h and net/if.h in old gcc 4.x
+#include <linux/wireless.h>
+#include <sys/ioctl.h>
+#endif
+
 uint32_t net32_add(uint32_t netorder_value, uint32_t cpuorder_increment)
 {
 	return htonl(ntohl(netorder_value)+cpuorder_increment);
@@ -36,6 +46,11 @@ uint32_t net32_add(uint32_t netorder_value, uint32_t cpuorder_increment)
 uint32_t net16_add(uint16_t netorder_value, uint16_t cpuorder_increment)
 {
 	return htons(ntohs(netorder_value)+cpuorder_increment);
+}
+
+bool ip_has_df(const struct ip *ip)
+{
+	return ip && !!(ntohs(ip->ip_off) & IP_DF);
 }
 
 uint8_t *tcp_find_option(struct tcphdr *tcp, uint8_t kind)
@@ -83,14 +98,27 @@ bool tcp_has_fastopen(const struct tcphdr *tcp)
 	opt = tcp_find_option((struct tcphdr*)tcp, 254);
 	return opt && opt[1]>=4 && opt[2]==0xF9 && opt[3]==0x89;
 }
+uint16_t tcp_find_mss(struct tcphdr *tcp)
+{
+	uint8_t *t = tcp_find_option(tcp,2);
+	return (t && t[1]==4) ? *(uint16_t*)(t+2) : 0;
+}
+bool tcp_has_sack(struct tcphdr *tcp)
+{
+	uint8_t *t = tcp_find_option(tcp,4);
+	return !!t;
+}
 
 // n prefix (nsport, nwsize) means network byte order
 static void fill_tcphdr(
 	struct tcphdr *tcp, uint32_t fooling, uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nsport, uint16_t ndport,
 	uint16_t nwsize, uint8_t scale_factor,
 	uint32_t *timestamps,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	uint16_t data_len)
@@ -111,28 +139,40 @@ static void fill_tcphdr(
 		tcp->th_seq = nseq;
 		tcp->th_ack = nack_seq;
 	}
-	tcp->th_off       = 5;
+	tcp->th_off = 5;
 	if ((fooling & FOOL_DATANOACK) && !(tcp_flags & (TH_SYN|TH_RST)) && data_len)
 		tcp_flags &= ~TH_ACK;
 	*((uint8_t*)tcp+13)= tcp_flags;
 	tcp->th_win     = nwsize;
+	if (nmss)
+	{
+		tcpopt[t++] = 2; // kind
+		tcpopt[t++] = 4; // len
+		*(uint16_t*)(tcpopt+t) = nmss;
+		t+=2;
+	}
+	if (sack)
+	{
+		tcpopt[t++] = 4; // kind
+		tcpopt[t++] = 2; // len
+	}
 	if (fooling & FOOL_MD5SIG)
 	{
-		tcpopt[0] = 19; // kind
-		tcpopt[1] = 18; // len
-		*(uint32_t*)(tcpopt+2)=random();
-		*(uint32_t*)(tcpopt+6)=random();
-		*(uint32_t*)(tcpopt+10)=random();
-		*(uint32_t*)(tcpopt+14)=random();
-		t=18;
+		tcpopt[t] = 19; // kind
+		tcpopt[t+1] = 18; // len
+		*(uint32_t*)(tcpopt+t+2)=random();
+		*(uint32_t*)(tcpopt+t+6)=random();
+		*(uint32_t*)(tcpopt+t+10)=random();
+		*(uint32_t*)(tcpopt+t+14)=random();
+		t+=18;
 	}
-	if (timestamps || (fooling & FOOL_TS))
+	if (timestamps)
 	{
 		tcpopt[t] = 8; // kind
 		tcpopt[t+1] = 10; // len
-		// forge only TSecr if orig timestamp is present
-		*(uint32_t*)(tcpopt+t+2) = timestamps ? timestamps[0] : -1;
-		*(uint32_t*)(tcpopt+t+6) = (timestamps && !(fooling & FOOL_TS)) ? timestamps[1] : -1;
+		memcpy(tcpopt+t+2,timestamps,8);
+		// forge TSval, keep TSecr
+		if (fooling & FOOL_TS) *(uint32_t*)(tcpopt+t+2) = net32_add(*(uint32_t*)(tcpopt+t+2),ts_increment);
 		t+=10;
 	}
 	if (scale_factor!=SCALE_NONE)
@@ -145,10 +185,12 @@ static void fill_tcphdr(
 	tcp->th_off += t>>2;
 	tcp->th_sum = 0;
 }
-static uint16_t tcpopt_len(uint32_t fooling, const uint32_t *timestamps, uint8_t scale_factor)
+static uint16_t tcpopt_len(bool sack, bool mss, uint32_t fooling, const uint32_t *timestamps, uint8_t scale_factor)
 {
 	uint16_t t=0;
-	if (fooling & FOOL_MD5SIG) t=18;
+	if (sack) t+=2;
+	if (mss) t+=4;
+	if (fooling & FOOL_MD5SIG) t+=18;
 	if ((fooling & FOOL_TS) || timestamps) t+=10;
 	if (scale_factor!=SCALE_NONE) t+=3;
 	return (t+3)&~3;
@@ -163,11 +205,11 @@ static void fill_udphdr(struct udphdr *udp, uint16_t nsport, uint16_t ndport, ui
 	udp->uh_sum = 0;
 }
 
-static void fill_iphdr(struct ip *ip, const struct in_addr *src, const struct in_addr *dst, uint16_t pktlen, uint8_t proto, uint8_t ttl, uint8_t tos, uint16_t ip_id)
+static void fill_iphdr(struct ip *ip, const struct in_addr *src, const struct in_addr *dst, uint16_t pktlen, uint8_t proto, bool DF, uint8_t ttl, uint8_t tos, uint16_t ip_id)
 {
 	ip->ip_tos = tos;
 	ip->ip_sum = 0;
-	ip->ip_off = 0;
+	ip->ip_off = DF ? htons(IP_DF) : 0;
 	ip->ip_v = 4;
 	ip->ip_hl = 5;
 	ip->ip_len = htons(pktlen);
@@ -190,20 +232,24 @@ static void fill_ip6hdr(struct ip6_hdr *ip6, const struct in6_addr *src, const s
 bool prepare_tcp_segment4(
 	const struct sockaddr_in *src, const struct sockaddr_in *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
 	uint32_t *timestamps,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
 	uint8_t *buf, size_t *buflen)
 {
-	uint16_t tcpoptlen = tcpopt_len(fooling,timestamps,scale_factor);
+	uint16_t tcpoptlen = tcpopt_len(sack,!!nmss,fooling,timestamps,scale_factor);
 	uint16_t ip_payload_len = sizeof(struct tcphdr) + tcpoptlen + len;
 	uint16_t pktlen = sizeof(struct ip) + ip_payload_len;
 	if (pktlen>*buflen) return false;
@@ -212,12 +258,12 @@ bool prepare_tcp_segment4(
 	struct tcphdr *tcp = (struct tcphdr*)(ip+1);
 	uint8_t *payload = (uint8_t*)(tcp+1)+tcpoptlen;
 
-	fill_iphdr(ip, &src->sin_addr, &dst->sin_addr, pktlen, IPPROTO_TCP, ttl, tos, ip_id);
-	fill_tcphdr(tcp,fooling,tcp_flags,nseq,nack_seq,src->sin_port,dst->sin_port,nwsize,scale_factor,timestamps,badseq_increment,badseq_ack_increment,len);
+	fill_iphdr(ip, &src->sin_addr, &dst->sin_addr, pktlen, IPPROTO_TCP, DF, ttl, tos, ip_id);
+	fill_tcphdr(tcp,fooling,tcp_flags,sack,nmss,nseq,nack_seq,src->sin_port,dst->sin_port,nwsize,scale_factor,timestamps,ts_increment,badseq_increment,badseq_ack_increment,len);
 
 	memcpy(payload,data,len);
 	tcp4_fix_checksum(tcp,ip_payload_len,&ip->ip_src,&ip->ip_dst);
-	if (fooling & FOOL_BADSUM) tcp->th_sum^=htons(0xBEAF);
+	if (fooling & FOOL_BADSUM) tcp->th_sum^=(uint16_t)(1+random()%0xFFFF);
 
 	*buflen = pktlen;
 	return true;
@@ -226,6 +272,8 @@ bool prepare_tcp_segment4(
 bool prepare_tcp_segment6(
 	const struct sockaddr_in6 *src, const struct sockaddr_in6 *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
@@ -233,12 +281,13 @@ bool prepare_tcp_segment6(
 	uint8_t ttl,
 	uint32_t flow_label,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
 	uint8_t *buf, size_t *buflen)
 {
-	uint16_t tcpoptlen = tcpopt_len(fooling,timestamps,scale_factor);
+	uint16_t tcpoptlen = tcpopt_len(sack,!!nmss,fooling,timestamps,scale_factor);
 	uint16_t transport_payload_len = sizeof(struct tcphdr) + tcpoptlen + len;
 	uint16_t ip_payload_len = transport_payload_len +
 		8*!!((fooling & (FOOL_HOPBYHOP|FOOL_HOPBYHOP2))==FOOL_HOPBYHOP) +
@@ -297,11 +346,11 @@ bool prepare_tcp_segment6(
 	uint8_t *payload = (uint8_t*)(tcp+1)+tcpoptlen;
 
 	fill_ip6hdr(ip6, &src->sin6_addr, &dst->sin6_addr, ip_payload_len, proto, ttl, flow_label);
-	fill_tcphdr(tcp,fooling,tcp_flags,nseq,nack_seq,src->sin6_port,dst->sin6_port,nwsize,scale_factor,timestamps,badseq_increment,badseq_ack_increment,len);
+	fill_tcphdr(tcp,fooling,tcp_flags,sack,nmss,nseq,nack_seq,src->sin6_port,dst->sin6_port,nwsize,scale_factor,timestamps,ts_increment,badseq_increment,badseq_ack_increment,len);
 
 	memcpy(payload,data,len);
 	tcp6_fix_checksum(tcp,transport_payload_len,&ip6->ip6_src,&ip6->ip6_dst);
-	if (fooling & FOOL_BADSUM) tcp->th_sum^=htons(0xBEAF);
+	if (fooling & FOOL_BADSUM) tcp->th_sum^=(1+random()%0xFFFF);
 
 	*buflen = pktlen;
 	return true;
@@ -310,24 +359,28 @@ bool prepare_tcp_segment6(
 bool prepare_tcp_segment(
 	const struct sockaddr *src, const struct sockaddr *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
 	uint32_t *timestamps,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
 	uint32_t flow_label,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
 	uint8_t *buf, size_t *buflen)
 {
 	return (src->sa_family==AF_INET && dst->sa_family==AF_INET) ?
-		prepare_tcp_segment4((struct sockaddr_in *)src,(struct sockaddr_in *)dst,tcp_flags,nseq,nack_seq,nwsize,scale_factor,timestamps,ttl,tos,ip_id,fooling,badseq_increment,badseq_ack_increment,data,len,buf,buflen) :
+		prepare_tcp_segment4((struct sockaddr_in *)src,(struct sockaddr_in *)dst,tcp_flags,sack,nmss,nseq,nack_seq,nwsize,scale_factor,timestamps,DF,ttl,tos,ip_id,fooling,ts_increment,badseq_increment,badseq_ack_increment,data,len,buf,buflen) :
 		(src->sa_family==AF_INET6 && dst->sa_family==AF_INET6) ?
-		prepare_tcp_segment6((struct sockaddr_in6 *)src,(struct sockaddr_in6 *)dst,tcp_flags,nseq,nack_seq,nwsize,scale_factor,timestamps,ttl,flow_label,fooling,badseq_increment,badseq_ack_increment,data,len,buf,buflen) :
+		prepare_tcp_segment6((struct sockaddr_in6 *)src,(struct sockaddr_in6 *)dst,tcp_flags,sack,nmss,nseq,nack_seq,nwsize,scale_factor,timestamps,ttl,flow_label,fooling,ts_increment,badseq_increment,badseq_ack_increment,data,len,buf,buflen) :
 		false;
 }
 
@@ -335,6 +388,7 @@ bool prepare_tcp_segment(
 // padlen<0 means payload shrinking
 bool prepare_udp_segment4(
 	const struct sockaddr_in *src, const struct sockaddr_in *dst,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
@@ -361,7 +415,7 @@ bool prepare_udp_segment4(
 	uint8_t *payload = (uint8_t*)(udp+1);
 
 
-	fill_iphdr(ip, &src->sin_addr, &dst->sin_addr, pktlen, IPPROTO_UDP, ttl, tos, ip_id);
+	fill_iphdr(ip, &src->sin_addr, &dst->sin_addr, pktlen, IPPROTO_UDP, DF, ttl, tos, ip_id);
 	fill_udphdr(udp, src->sin_port, dst->sin_port, datalen);
 
 	memcpy(payload,data,len);
@@ -370,7 +424,7 @@ bool prepare_udp_segment4(
 	else
 		memset(payload+len,0,padlen);
 	udp4_fix_checksum(udp,ip_payload_len,&ip->ip_src,&ip->ip_dst);
-	if (fooling & FOOL_BADSUM) udp->uh_sum^=htons(0xBEAF);
+	if (fooling & FOOL_BADSUM) udp->uh_sum^=(1+random()%0xFFFF);
 
 	*buflen = pktlen;
 	return true;
@@ -459,13 +513,14 @@ bool prepare_udp_segment6(
 	else
 		memset(payload+len,0,padlen);
 	udp6_fix_checksum(udp,transport_payload_len,&ip6->ip6_src,&ip6->ip6_dst);
-	if (fooling & FOOL_BADSUM) udp->uh_sum^=htons(0xBEAF);
+	if (fooling & FOOL_BADSUM) udp->uh_sum^=(1+random()%0xFFFF);
 
 	*buflen = pktlen;
 	return true;
 }
 bool prepare_udp_segment(
 	const struct sockaddr *src, const struct sockaddr *dst,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
@@ -477,7 +532,7 @@ bool prepare_udp_segment(
 	uint8_t *buf, size_t *buflen)
 {
 	return (src->sa_family==AF_INET && dst->sa_family==AF_INET) ?
-		prepare_udp_segment4((struct sockaddr_in *)src,(struct sockaddr_in *)dst,ttl,tos,ip_id,fooling,padding,padding_size,padlen,data,len,buf,buflen) :
+		prepare_udp_segment4((struct sockaddr_in *)src,(struct sockaddr_in *)dst,DF,ttl,tos,ip_id,fooling,padding,padding_size,padlen,data,len,buf,buflen) :
 		(src->sa_family==AF_INET6 && dst->sa_family==AF_INET6) ?
 		prepare_udp_segment6((struct sockaddr_in6 *)src,(struct sockaddr_in6 *)dst,ttl,flow_label,fooling,padding,padding_size,padlen,data,len,buf,buflen) :
 		false;
@@ -601,10 +656,29 @@ bool ip_frag(
 		return false;
 }
 
-void rewrite_ttl(struct ip *ip, struct ip6_hdr *ip6, uint8_t ttl)
+bool rewrite_ttl(struct ip *ip, struct ip6_hdr *ip6, uint8_t ttl)
 {
-	if (ip)	ip->ip_ttl = ttl;
-	if (ip6) ip6->ip6_ctlun.ip6_un1.ip6_un1_hlim = ttl;
+	if (ttl)
+	{
+		if (ip)
+		{
+			if (ip->ip_ttl!=ttl)
+			{
+				ip->ip_ttl = ttl;
+				ip4_fix_checksum(ip);
+				return true;
+			}
+		}
+		else if (ip6)
+		{
+			if (ip6->ip6_ctlun.ip6_un1.ip6_un1_hlim!=ttl)
+			{
+				ip6->ip6_ctlun.ip6_un1.ip6_un1_hlim = ttl;
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 
@@ -1772,16 +1846,268 @@ bool rawsend_queue(struct rawpacket_tailhead *q)
 }
 
 
-// return guessed fake ttl value. 0 means unsuccessfull, should not perform autottl fooling
-// ttl = TTL of incoming packet
-uint8_t autottl_guess(uint8_t ttl, const autottl *attl)
-{
-	uint8_t orig, path, fake;
 
+#if defined(HAS_FILTER_SSID) && defined(__linux__)
+
+// linux-specific wlan retrieval implementation
+
+typedef void netlink_prepare_nlh_cb_t(struct nlmsghdr *nlh);
+
+static bool netlink_genl_simple_transact(struct mnl_socket* nl, uint16_t type, uint16_t flags, uint8_t cmd, uint8_t version, netlink_prepare_nlh_cb_t cb_prepare_nlh, mnl_cb_t cb_data, void *data)
+{
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct nlmsghdr *nlh;
+	struct genlmsghdr *genl;
+	ssize_t rd;
+
+	nlh = mnl_nlmsg_put_header(buf);
+	nlh->nlmsg_type	= type;
+	nlh->nlmsg_flags = flags;
+
+	genl = mnl_nlmsg_put_extra_header(nlh, sizeof(struct genlmsghdr));
+	genl->cmd = cmd;
+	genl->version = version;
+
+	if (cb_prepare_nlh) cb_prepare_nlh(nlh);
+
+	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0)
+	{
+		DLOG_PERROR("mnl_socket_sendto");
+		return false;
+	}
+
+	while ((rd=mnl_socket_recvfrom(nl, buf, sizeof(buf))) > 0)
+	{
+		switch(mnl_cb_run(buf, rd, 0, 0, cb_data, data))
+		{
+			case MNL_CB_STOP:
+				return true;
+			case MNL_CB_OK:
+				break;
+			default:
+				return false;
+		}
+	}
+
+	return false;
+}
+
+static void wlan_id_prepare(struct nlmsghdr *nlh)
+{
+	mnl_attr_put_strz(nlh, CTRL_ATTR_FAMILY_NAME, "nl80211");
+}
+static int wlan_id_attr_cb(const struct nlattr *attr, void *data)
+{
+	if (mnl_attr_type_valid(attr, CTRL_ATTR_MAX) < 0)
+	{
+		DLOG_PERROR("mnl_attr_type_valid");
+		return MNL_CB_ERROR;
+	}
+
+	switch(mnl_attr_get_type(attr))
+	{
+		case CTRL_ATTR_FAMILY_ID:
+			if (mnl_attr_validate(attr, MNL_TYPE_U16) < 0)
+			{
+				DLOG_PERROR("mnl_attr_validate(family_id)");
+				return MNL_CB_ERROR;
+			}
+			*((uint16_t*)data) = mnl_attr_get_u16(attr);
+		break;
+	}
+	return MNL_CB_OK;
+}
+static int wlan_id_cb(const struct nlmsghdr *nlh, void *data)
+{
+	return mnl_attr_parse(nlh, sizeof(struct genlmsghdr), wlan_id_attr_cb, data);
+}
+static uint16_t wlan_get_family_id(struct mnl_socket* nl)
+{
+	uint16_t id;
+	return netlink_genl_simple_transact(nl, GENL_ID_CTRL, NLM_F_REQUEST | NLM_F_ACK, CTRL_CMD_GETFAMILY, 1, wlan_id_prepare, wlan_id_cb, &id) ? id : 0;
+}
+
+static int wlan_info_attr_cb(const struct nlattr *attr, void *data)
+{
+	struct wlan_interface *wlan = (struct wlan_interface *)data;
+	switch(mnl_attr_get_type(attr))
+	{
+		case NL80211_ATTR_IFINDEX:
+			if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0)
+			{
+				DLOG_PERROR("mnl_attr_validate(ifindex)");
+				return MNL_CB_ERROR;
+			}
+			wlan->ifindex = mnl_attr_get_u32(attr);
+			break;
+		case NL80211_ATTR_SSID:
+			if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0)
+			{
+				DLOG_PERROR("mnl_attr_validate(ssid)");
+				return MNL_CB_ERROR;
+			}
+			snprintf(wlan->ssid,sizeof(wlan->ssid),"%s",mnl_attr_get_str(attr));
+			break;
+		case NL80211_ATTR_IFNAME:
+			if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0)
+			{
+				DLOG_PERROR("mnl_attr_validate(ifname)");
+				return MNL_CB_ERROR;
+			}
+			snprintf(wlan->ifname,sizeof(wlan->ifname),"%s",mnl_attr_get_str(attr));
+			break;
+	}
+	return MNL_CB_OK;
+}
+static int wlan_info_cb(const struct nlmsghdr *nlh, void *data)
+{
+	int ret;
+	struct wlan_interface_collection *wc = (struct wlan_interface_collection*)data;
+	if (wc->count>=WLAN_INTERFACE_MAX) return MNL_CB_OK;
+	memset(wc->wlan+wc->count,0,sizeof(wc->wlan[0]));
+	ret = mnl_attr_parse(nlh, sizeof(struct genlmsghdr), wlan_info_attr_cb, wc->wlan+wc->count);
+	if (ret>=0 && *wc->wlan[wc->count].ifname && wc->wlan[wc->count].ifindex)
+	{
+		if (*wc->wlan[wc->count].ssid)
+			wc->count++;
+		else
+		{
+			// sometimes nl80211 does not return SSID but wireless ext does
+			int wext_fd = socket(AF_INET, SOCK_DGRAM, 0);
+			if (wext_fd!=-1)
+			{
+				struct iwreq req;
+				snprintf(req.ifr_ifrn.ifrn_name,sizeof(req.ifr_ifrn.ifrn_name),"%s",wc->wlan[wc->count].ifname);
+				req.u.essid.pointer = wc->wlan[wc->count].ssid;
+				req.u.essid.length = sizeof(wc->wlan[wc->count].ssid);
+				req.u.essid.flags = 0;
+				if (ioctl(wext_fd, SIOCGIWESSID, &req)!=-1)
+					if (*wc->wlan[wc->count].ssid)
+						wc->count++;
+				close(wext_fd);
+			}
+		}
+	}
+	return ret;
+}
+static bool wlan_info(struct mnl_socket* nl, uint16_t wlan_family_id, struct wlan_interface_collection* w)
+{
+	return netlink_genl_simple_transact(nl, wlan_family_id, NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP, NL80211_CMD_GET_INTERFACE, 0, NULL, wlan_info_cb, w);
+}
+
+static bool wlan_init80211(struct mnl_socket** nl)
+{
+	if (!(*nl = mnl_socket_open(NETLINK_GENERIC)))
+	{
+		DLOG_PERROR("mnl_socket_open");
+		return false;
+	}
+	if (mnl_socket_bind(*nl, 0, MNL_SOCKET_AUTOPID))
+	{
+		DLOG_PERROR("mnl_socket_bind");
+		return false;
+	}
+	return true;
+}
+
+static void wlan_deinit80211(struct mnl_socket** nl)
+{
+	if (*nl)
+	{
+		mnl_socket_close(*nl);
+		*nl = NULL;
+	}
+}
+
+static time_t wlan_info_last = 0;
+static bool wlan_info_rate_limited(struct mnl_socket* nl, uint16_t wlan_family_id, struct wlan_interface_collection* w)
+{
+	bool bres = true;
+	time_t now = time(NULL);
+
+	// do not purge too often to save resources
+	if (wlan_info_last != now)
+	{
+		bres = wlan_info(nl,wlan_family_id,w);
+		wlan_info_last = now;
+	}
+	return bres;
+}
+
+static struct mnl_socket* nl_wifi = NULL;
+static uint16_t id_nl80211;
+struct wlan_interface_collection wlans = { .count = 0 };
+
+void wlan_info_deinit(void)
+{
+	wlan_deinit80211(&nl_wifi);
+}
+bool wlan_info_init(void)
+{
+	wlan_info_deinit();
+
+	if (!wlan_init80211(&nl_wifi)) return false;
+	if (!(id_nl80211 = wlan_get_family_id(nl_wifi)))
+	{
+		wlan_info_deinit();
+		return false;
+	}
+	return true;
+}
+bool wlan_info_get(void)
+{
+	return wlan_info(nl_wifi, id_nl80211, &wlans);
+}
+bool wlan_info_get_rate_limited(void)
+{
+	return wlan_info_rate_limited(nl_wifi, id_nl80211, &wlans);
+}
+
+#endif
+
+
+#ifdef HAS_FILTER_SSID
+const char *wlan_ifname2ssid(const struct wlan_interface_collection *w, const char *ifname)
+{
+	int i;
+	if (ifname)
+	{
+		for (i=0;i<w->count;i++)
+			if (!strcmp(w->wlan[i].ifname,ifname))
+				return w->wlan[i].ssid;
+	}
+	return NULL;
+}
+const char *wlan_ifidx2ssid(const struct wlan_interface_collection *w,int ifidx)
+{
+	int i;
+	for (i=0;i<w->count;i++)
+		if (w->wlan[i].ifindex == ifidx)
+			return w->wlan[i].ssid;
+	return NULL;
+}
+const char *wlan_ssid_search_ifname(const char *ifname)
+{
+	return wlan_ifname2ssid(&wlans,ifname);
+}
+const char *wlan_ssid_search_ifidx(int ifidx)
+{
+	return wlan_ifidx2ssid(&wlans,ifidx);
+}
+
+#endif
+
+
+
+uint8_t hop_count_guess(uint8_t ttl)
+{
 	// 18.65.168.125 ( cloudfront ) 	255
 	// 157.254.246.178 			128
 	// 1.1.1.1				 64
 	// guess original ttl. consider path lengths less than 32 hops
+
+	uint8_t orig;
+
 	if (ttl>223)
 		orig=255;
 	else if (ttl<128 && ttl>96)
@@ -1791,13 +2117,21 @@ uint8_t autottl_guess(uint8_t ttl, const autottl *attl)
 	else
 		return 0;
 
-	path = orig - ttl;
+	return orig - ttl;
+}
+// return guessed fake ttl value. 0 means unsuccessfull, should not perform autottl fooling
+uint8_t autottl_eval(uint8_t hop_count, const autottl *attl)
+{
+	uint8_t fake;
+	int d;
 
-	fake = path > attl->delta ? path - attl->delta : attl->min;
-	if (fake<attl->min) fake=attl->min;
-	else if (fake>attl->max) fake=attl->max;
+	d = (int)hop_count + attl->delta;
+	if (d<attl->min) fake=attl->min;
+	else if (d>attl->max) fake=attl->max;
+	else fake=(uint8_t)d;
 
-	if (fake>=path) return 0;
+	if (attl->delta<0 && fake>=hop_count || attl->delta>=0 && fake<hop_count)
+		return 0;
 
 	return fake;
 }
@@ -1849,15 +2183,15 @@ void verdict_tcp_csum_fix(uint8_t verdict, struct tcphdr *tcphdr, size_t transpo
 {
 	if (!(verdict & VERDICT_NOCSUM))
 	{
+		#ifdef __CYGWIN__
 		// always fix csum for windivert. original can be partial or bad
-		#ifndef __CYGWIN__
-		#ifdef __FreeBSD__
+		if ((verdict & VERDICT_MASK)!=VERDICT_DROP)
+		#elif defined(__FreeBSD__)
 		// FreeBSD tend to pass ipv6 frames with wrong checksum
 		if ((verdict & VERDICT_MASK)==VERDICT_MODIFY || ip6hdr)
 		#else
 		// if original packet was tampered earlier it needs checksum fixed
 		if ((verdict & VERDICT_MASK)==VERDICT_MODIFY)
-		#endif
 		#endif
 			tcp_fix_checksum(tcphdr,transport_len,ip,ip6hdr);
 	}
@@ -1866,15 +2200,15 @@ void verdict_udp_csum_fix(uint8_t verdict, struct udphdr *udphdr, size_t transpo
 {
 	if (!(verdict & VERDICT_NOCSUM))
 	{
+		#ifdef __CYGWIN__
 		// always fix csum for windivert. original can be partial or bad
-		#ifndef __CYGWIN__
-		#ifdef __FreeBSD__
+		if ((verdict & VERDICT_MASK)!=VERDICT_DROP)
+		#elif defined(__FreeBSD__)
 		// FreeBSD tend to pass ipv6 frames with wrong checksum
 		if ((verdict & VERDICT_MASK)==VERDICT_MODIFY || ip6hdr)
 		#else
 		// if original packet was tampered earlier it needs checksum fixed
 		if ((verdict & VERDICT_MASK)==VERDICT_MODIFY)
-		#endif
 		#endif
 			udp_fix_checksum(udphdr,transport_len,ip,ip6hdr);
 	}

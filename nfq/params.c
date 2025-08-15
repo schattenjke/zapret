@@ -3,6 +3,9 @@
 #include <stdarg.h>
 #include <syslog.h>
 #include <errno.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "pools.h"
 #include "desync.h"
@@ -40,18 +43,47 @@ int DLOG_FILENAME(const char *filename, const char *format, va_list args)
 	return r;
 }
 
-static char syslog_buf[1024];
-static size_t syslog_buf_sz=0;
-static void syslog_buffered(int priority, const char *format, va_list args)
+typedef void (*f_log_function)(int priority, const char *line);
+
+static char log_buf[1024];
+static size_t log_buf_sz=0;
+static void syslog_log_function(int priority, const char *line)
 {
-	if (vsnprintf(syslog_buf+syslog_buf_sz,sizeof(syslog_buf)-syslog_buf_sz,format,args)>0)
+	syslog(priority,"%s",log_buf);
+}
+#ifdef __ANDROID__
+static enum android_LogPriority syslog_priority_to_android(int priority)
+{
+	enum android_LogPriority ap;
+	switch(priority)
 	{
-		syslog_buf_sz=strlen(syslog_buf);
+		case LOG_INFO:
+		case LOG_NOTICE: ap=ANDROID_LOG_INFO; break;
+		case LOG_ERR: ap=ANDROID_LOG_ERROR; break;
+		case LOG_WARNING: ap=ANDROID_LOG_WARN; break;
+		case LOG_EMERG:
+		case LOG_ALERT:
+		case LOG_CRIT: ap=ANDROID_LOG_FATAL; break;
+		case LOG_DEBUG: ap=ANDROID_LOG_DEBUG; break;
+		default: ap=ANDROID_LOG_UNKNOWN;
+	}
+	return ap;
+}
+static void android_log_function(int priority, const char *line)
+{
+	__android_log_print(syslog_priority_to_android(priority), progname, "%s", line);
+}
+#endif
+static void log_buffered(f_log_function log_function, int syslog_priority, const char *format, va_list args)
+{
+	if (vsnprintf(log_buf+log_buf_sz,sizeof(log_buf)-log_buf_sz,format,args)>0)
+	{
+		log_buf_sz=strlen(log_buf);
 		// log when buffer is full or buffer ends with \n
-		if (syslog_buf_sz>=(sizeof(syslog_buf)-1) || (syslog_buf_sz && syslog_buf[syslog_buf_sz-1]=='\n'))
+		if (log_buf_sz>=(sizeof(log_buf)-1) || (log_buf_sz && log_buf[log_buf_sz-1]=='\n'))
 		{
-			syslog(priority,"%s",syslog_buf);
-			syslog_buf_sz = 0;
+			log_function(syslog_priority,log_buf);
+			log_buf_sz = 0;
 		}
 	}
 }
@@ -79,9 +111,16 @@ static int DLOG_VA(const char *format, int syslog_priority, bool condup, va_list
 				break;
 			case LOG_TARGET_SYSLOG:
 				// skip newlines
-				syslog_buffered(syslog_priority,format,args);
+				log_buffered(syslog_log_function,syslog_priority,format,args);
 				r = 1;
 				break;
+#ifdef __ANDROID__
+			case LOG_TARGET_ANDROID:
+				// skip newlines
+				log_buffered(android_log_function,syslog_priority,format,args);
+				r = 1;
+				break;
+#endif
 			default:
 				break;
 		}
@@ -187,10 +226,11 @@ void dp_init(struct desync_profile *dp)
 	dp->desync_repeats = 1;
 	dp->fake_syndata_size = 16;
 	dp->wscale=-1; // default - dont change scale factor (client)
-	dp->desync_ttl6 = 0xFF; // unused
-	dp->desync_badseq_increment = BADSEQ_INCREMENT_DEFAULT;
-	dp->desync_badseq_ack_increment = BADSEQ_ACK_INCREMENT_DEFAULT;
-	dp->wssize_cutoff_mode = dp->desync_start_mode = dp->desync_cutoff_mode = 'n'; // packet number by default
+	dp->desync_ttl6 = dp->dup_ttl6 = dp->orig_mod_ttl6 = 0xFF; // unused
+	dp->desync_ts_increment = dp->dup_ts_increment = TS_INCREMENT_DEFAULT;
+	dp->desync_badseq_increment = dp->dup_badseq_increment = BADSEQ_INCREMENT_DEFAULT;
+	dp->desync_badseq_ack_increment = dp->dup_badseq_ack_increment = BADSEQ_ACK_INCREMENT_DEFAULT;
+	dp->wssize_cutoff_mode = dp->desync_start_mode = dp->desync_cutoff_mode = dp->dup_start_mode = dp->dup_cutoff_mode = dp->orig_mod_start_mode = dp->orig_mod_cutoff_mode = 'n'; // packet number by default
 	dp->udplen_increment = UDPLEN_INCREMENT_DEFAULT;
 	dp->hostlist_auto_fail_threshold = HOSTLIST_AUTO_FAIL_THRESHOLD_DEFAULT;
 	dp->hostlist_auto_fail_time = HOSTLIST_AUTO_FAIL_TIME_DEFAULT;
@@ -263,6 +303,9 @@ static void dp_clear_dynamic(struct desync_profile *dp)
 	ipset_collection_destroy(&dp->ips_collection_exclude);
 	port_filters_destroy(&dp->pf_tcp);
 	port_filters_destroy(&dp->pf_udp);
+#ifdef HAS_FILTER_SSID
+	strlist_destroy(&dp->filter_ssid);
+#endif
 	HostFailPoolDestroy(&dp->hostlist_auto_fail_counters);
 	struct blob_collection_head **fake,*fakes[] = {&dp->fake_http, &dp->fake_tls, &dp->fake_unknown, &dp->fake_unknown_udp, &dp->fake_quic, &dp->fake_wg, &dp->fake_dht, &dp->fake_discord, &dp->fake_stun, NULL};
 	for(fake=fakes;*fake;fake++) blob_collection_destroy(*fake);
@@ -293,4 +336,42 @@ bool dp_list_have_autohostlist(struct desync_profile_list_head *head)
 		if (dpl->dp.hostlist_auto)
 			return true;
 	return false;
+}
+// check if we need empty outgoing ACK
+bool dp_list_need_all_out(struct desync_profile_list_head *head)
+{
+	struct desync_profile_list *dpl;
+	LIST_FOREACH(dpl, head, next)
+		if (dpl->dp.dup_repeats || PROFILE_HAS_ORIG_MOD(&dpl->dp))
+			return true;
+	return false;
+}
+
+
+#if !defined( __OpenBSD__) && !defined(__ANDROID__)
+void cleanup_args(struct params_s *params)
+{
+	wordfree(&params->wexp);
+}
+#endif
+
+void cleanup_params(struct params_s *params)
+{
+#if !defined( __OpenBSD__) && !defined(__ANDROID__)
+	cleanup_args(params);
+#endif
+
+	ConntrackPoolDestroy(&params->conntrack);
+
+	dp_list_destroy(&params->desync_profiles);
+
+	hostlist_files_destroy(&params->hostlists);
+	ipset_files_destroy(&params->ipsets);
+	ipcacheDestroy(&params->ipcache);
+#ifdef __CYGWIN__
+	strlist_destroy(&params->ssid_filter);
+	strlist_destroy(&params->nlm_filter);
+#else
+	free(params->user); params->user=NULL;
+#endif
 }

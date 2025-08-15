@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <syslog.h>
+#include <grp.h>
 
 #ifdef __CYGWIN__
 #include "win.h"
@@ -99,7 +100,11 @@ static void onusr2(int sig)
 		printf("\nDESYNC PROFILE %d\n",dpl->dp.n);
 		HostFailPoolDump(dpl->dp.hostlist_auto_fail_counters);
 	}
-	
+	if (params.autottl_present || params.cache_hostname)
+	{
+		printf("\nIPCACHE\n");
+		ipcachePrint(&params.ipcache);
+	}
 	printf("\n");
 }
 
@@ -111,7 +116,7 @@ static void pre_desync(void)
 }
 
 
-static uint8_t processPacketData(uint32_t *mark, const char *ifout, uint8_t *data_pkt, size_t *len_pkt)
+static uint8_t processPacketData(uint32_t *mark, const char *ifin, const char *ifout, uint8_t *data_pkt, size_t *len_pkt)
 {
 #ifdef __linux__
 	if (*mark & params.desync_fwmark)
@@ -120,7 +125,7 @@ static uint8_t processPacketData(uint32_t *mark, const char *ifout, uint8_t *dat
 		return VERDICT_PASS;
 	}
 #endif
-	return dpi_desync_packet(*mark, ifout, data_pkt, len_pkt);
+	return dpi_desync_packet(*mark, ifin, ifout, data_pkt, len_pkt);
 }
 
 
@@ -154,8 +159,8 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
 	size_t len;
 	struct nfqnl_msg_packet_hdr *ph;
 	uint8_t *data;
-	uint32_t ifidx;
-	char ifout[IFNAMSIZ+1];
+	uint32_t ifidx_out, ifidx_in;
+	char ifout[IFNAMSIZ], ifin[IFNAMSIZ];
 
 	ph = nfq_get_msg_packet_hdr(nfa);
 	id = ph ? ntohl(ph->packet_id) : 0;
@@ -163,27 +168,20 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
 	uint32_t mark = nfq_get_nfmark(nfa);
 	ilen = nfq_get_payload(nfa, &data);
 
+	ifidx_out = nfq_get_outdev(nfa);
 	*ifout=0;
-	if (params.bind_fix4 || params.bind_fix6)
-	{
-		char ifin[IFNAMSIZ+1];
-		uint32_t ifidx_in;
+	if (ifidx_out) if_indextoname(ifidx_out,ifout);
 
-		ifidx = nfq_get_outdev(nfa);
-		if (ifidx) if_indextoname(ifidx,ifout);
-		*ifin=0;
-		ifidx_in = nfq_get_indev(nfa);
-		if (ifidx_in) if_indextoname(ifidx_in,ifin);
+	ifidx_in = nfq_get_indev(nfa);
+	*ifin=0;
+	if (ifidx_in) if_indextoname(ifidx_in,ifin);
 
-		DLOG("packet: id=%d len=%d mark=%08X ifin=%s(%u) ifout=%s(%u)\n", id, ilen, mark, ifin, ifidx_in, ifout, ifidx);
-	}
-	else
-		// save some syscalls
-		DLOG("packet: id=%d len=%d mark=%08X\n", id, ilen, mark);
+	DLOG("packet: id=%d len=%d mark=%08X ifin=%s(%u) ifout=%s(%u)\n", id, ilen, mark, ifin, ifidx_in, ifout, ifidx_out);
+
 	if (ilen >= 0)
 	{
 		len = ilen;
-		uint8_t verdict = processPacketData(&mark, ifout, data, &len);
+		uint8_t verdict = processPacketData(&mark, ifin, ifout, data, &len);
 		switch(verdict & VERDICT_MASK)
 		{
 		case VERDICT_MODIFY:
@@ -291,19 +289,51 @@ static int nfq_main(void)
 	struct nfq_q_handle *qh = NULL;
 	int fd,e;
 	ssize_t rd;
+	FILE *Fpid = NULL;
 
-	sec_harden();
-	if (params.droproot && !droproot(params.uid, params.gid) || !dropcaps())
+	if (*params.pidfile && !(Fpid=fopen(params.pidfile,"w")))
+	{
+		DLOG_PERROR("create pidfile");
 		return 1;
+	}
+
+	if (params.droproot && !droproot(params.uid, params.user, params.gid, params.gid_count) || !dropcaps())
+		goto err;
 	print_id();
 	if (params.droproot && !test_list_files())
-		return 1;
-
-	pre_desync();
+		goto err;
 
 	if (!nfq_init(&h,&qh))
-		return 1;
+		goto err;
 
+#ifdef HAS_FILTER_SSID
+	if (params.filter_ssid_present)
+	{
+		if (!wlan_info_init())
+		{
+			DLOG_ERR("cannot initialize wlan info capture\n");
+			goto err;
+		}
+		DLOG("wlan info capture initialized\n");
+	}
+#endif
+
+	if (params.daemon) daemonize();
+
+	sec_harden();
+
+	if (Fpid)
+	{
+		if (fprintf(Fpid, "%d", getpid())<=0)
+		{
+			DLOG_PERROR("write pidfile");
+			goto err;
+		}
+		fclose(Fpid);
+		Fpid=NULL;
+	}
+
+	pre_desync();
 	notify_ready();
 
 	fd = nfq_fd(h);
@@ -312,6 +342,11 @@ static int nfq_main(void)
 		while ((rd = recv(fd, buf, sizeof(buf), 0)) >= 0)
 		{
 			ReloadCheck();
+#ifdef HAS_FILTER_SSID
+			if (params.filter_ssid_present)
+				if (!wlan_info_get_rate_limited())
+					DLOG_ERR("cannot get wlan info\n");
+#endif
 			if (rd)
 			{
 				int r = nfq_handle_packet(h, (char *)buf, (int)rd);
@@ -328,7 +363,17 @@ static int nfq_main(void)
 	} while(e==ENOBUFS);
 
 	nfq_deinit(&h,&qh);
+#ifdef HAS_FILTER_SSID
+	wlan_info_deinit();
+#endif
 	return 0;
+err:
+	if (Fpid) fclose(Fpid);
+	nfq_deinit(&h,&qh);
+#ifdef HAS_FILTER_SSID
+	wlan_info_deinit();
+#endif
+	return 1;
 }
 
 #elif defined(BSD)
@@ -343,6 +388,13 @@ static int dvt_main(void)
 	socklen_t socklen;
 	ssize_t rd,wr;
 	fd_set fdset;
+	FILE *Fpid = NULL;
+
+	if (*params.pidfile && !(Fpid=fopen(params.pidfile,"w")))
+	{
+		DLOG_PERROR("create pidfile");
+		return 1;
+	}
 
 	{
 		struct sockaddr_in bp4;
@@ -394,11 +446,25 @@ static int dvt_main(void)
 	if (!rawsend_preinit(false,false))
 		goto exiterr;
 
-	if (params.droproot && !droproot(params.uid, params.gid))
+
+	if (params.droproot && !droproot(params.uid, params.user, params.gid, params.gid_count))
 		goto exiterr;
 	print_id();
 	if (params.droproot && !test_list_files())
 		goto exiterr;
+
+	if (params.daemon) daemonize();
+
+	if (Fpid)
+	{
+		if (fprintf(Fpid, "%d", getpid())<=0)
+		{
+			DLOG_PERROR("write pidfile");
+			goto exiterr;
+		}
+		fclose(Fpid);
+		Fpid=NULL;
+	}
 
 	pre_desync();
 
@@ -437,7 +503,7 @@ static int dvt_main(void)
 					ReloadCheck();
 
 					DLOG("packet: id=%u len=%zu\n", id, len);
-					verdict = processPacketData(&mark, NULL, buf, &len);
+					verdict = processPacketData(&mark, NULL, NULL, buf, &len);
 					switch (verdict & VERDICT_MASK)
 					{
 					case VERDICT_PASS:
@@ -467,6 +533,7 @@ static int dvt_main(void)
 
 	res=0;
 exiterr:
+	if (Fpid) fclose(Fpid);
 	if (fd[0]!=-1) close(fd[0]);
 	if (fd[1]!=-1) close(fd[1]);
 	return res;
@@ -484,15 +551,23 @@ static int win_main(const char *windivert_filter)
 	uint8_t packet[16384];
 	uint32_t mark;
 	WINDIVERT_ADDRESS wa;
-	char ifout[22];
+	char ifname[IFNAMSIZ];
 
-	pre_desync();
+	if (params.daemon) daemonize();
+
+	if (*params.pidfile && !writepid(params.pidfile))
+	{
+		DLOG_ERR("could not write pidfile");
+		return ERROR_TOO_MANY_OPEN_FILES; // code 4 = The system cannot open the file
+	}
 
 	if (!win_dark_init(&params.ssid_filter, &params.nlm_filter))
 	{
 		DLOG_ERR("win_dark_init failed. win32 error %u (0x%08X)\n", w_win32_error, w_win32_error);
 		return w_win32_error;
 	}
+
+	pre_desync();
 
 	for(;;)
 	{
@@ -550,8 +625,8 @@ static int win_main(const char *windivert_filter)
 
 			ReloadCheck();
 
-			*ifout=0;
-			if (wa.Outbound) snprintf(ifout,sizeof(ifout),"%u.%u", wa.Network.IfIdx, wa.Network.SubIfIdx);
+			*ifname=0;
+			snprintf(ifname,sizeof(ifname),"%u.%u", wa.Network.IfIdx, wa.Network.SubIfIdx);
 			DLOG("packet: id=%u len=%zu %s IPv6=%u IPChecksum=%u TCPChecksum=%u UDPChecksum=%u IfIdx=%u.%u\n", id, len, wa.Outbound ? "outbound" : "inbound", wa.IPv6, wa.IPChecksum, wa.TCPChecksum, wa.UDPChecksum, wa.Network.IfIdx, wa.Network.SubIfIdx);
 			if (wa.Impostor)
 			{
@@ -567,7 +642,7 @@ static int win_main(const char *windivert_filter)
 			{
 				mark=0;
 				// pseudo interface id IfIdx.SubIfIdx
-				verdict = processPacketData(&mark, ifout, packet, &len);
+				verdict = processPacketData(&mark, ifname, ifname, packet, &len);
 			}
 			switch (verdict & VERDICT_MASK)
 			{
@@ -592,6 +667,42 @@ static int win_main(const char *windivert_filter)
 #endif // multiple OS divert handlers
 
 
+
+
+static void exit_clean(int code)
+{
+	cleanup_params(&params);
+	exit(code);
+}
+
+
+static bool parse_uid(const char *opt, uid_t *uid, gid_t *gid, int *gid_count, int max_gids)
+{
+	unsigned int u;
+	char c, *p, *e;
+
+	*gid_count=0;
+	if ((e = strchr(optarg,':'))) *e++=0;
+	if (sscanf(opt,"%u",&u)!=1) return false;
+	*uid = (uid_t)u;
+	for (p=e ; p ; )
+	{
+		if ((e = strchr(p,',')))
+		{
+			c=*e;
+			*e=0;
+		}
+		if (p)
+		{
+			if (sscanf(p,"%u",&u)!=1) return false;
+			if (*gid_count>=max_gids) return false;
+			gid[(*gid_count)++] = (gid_t)u;
+		}
+		if (e) *e++=c;
+		p = e;
+	}
+	return true;
+}
 
 static bool parse_ws_scale_factor(char *s, uint16_t *wsize, uint8_t *wscale)
 {
@@ -619,44 +730,12 @@ static bool parse_ws_scale_factor(char *s, uint16_t *wsize, uint8_t *wscale)
 	return true;
 }
 
-
-
-#if !defined( __OpenBSD__) && !defined(__ANDROID__)
-static void cleanup_args()
-{
-	wordfree(&params.wexp);
-}
-#endif
-
-static void cleanup_params(void)
-{
-#if !defined( __OpenBSD__) && !defined(__ANDROID__)
-	cleanup_args();
-#endif
-
-	ConntrackPoolDestroy(&params.conntrack);
-
-	dp_list_destroy(&params.desync_profiles);
-
-	hostlist_files_destroy(&params.hostlists);
-	ipset_files_destroy(&params.ipsets);
-#ifdef __CYGWIN__
-	strlist_destroy(&params.ssid_filter);
-	strlist_destroy(&params.nlm_filter);
-#endif
-}
-static void exit_clean(int code)
-{
-	cleanup_params();
-	exit(code);
-}
-
 static bool parse_cutoff(const char *opt, unsigned int *value, char *mode)
 {
 	*mode = (*opt=='n' || *opt=='d' || *opt=='s') ? *opt++ : 'n';
 	return sscanf(opt, "%u", value)>0;
 }
-static bool parse_badseq_increment(const char *opt, uint32_t *value)
+static bool parse_net32_signed(const char *opt, uint32_t *value)
 {
 	if (((opt[0]=='0' && opt[1]=='x') || (opt[0]=='-' && opt[1]=='0' && opt[2]=='x')) && sscanf(opt+2+(opt[0]=='-'), "%X", (int32_t*)value)>0)
 	{
@@ -690,27 +769,43 @@ static void load_file_or_exit(const char *filename, void *buf, size_t *size)
 	}
 }
 
-static bool parse_autottl(const char *s, autottl *t)
+static bool parse_autottl(const char *s, autottl *t, int8_t def_delta, uint8_t def_min, uint8_t def_max)
 {
+	bool neg=true;
 	unsigned int delta,min,max;
-	AUTOTTL_SET_DEFAULT(*t);
+
+	t->delta = def_delta;
+	t->min = def_min;
+	t->max = def_max;
 	if (s)
 	{
-		max = t->max;
-		switch (sscanf(s,"%u:%u-%u",&delta,&min,&max))
+		// "-" means disable
+		if (s[0]=='-' && s[1]==0)
+			memset(t,0,sizeof(*t));
+		else
 		{
-			case 3:
-				if ((delta && !max) || max>255) return false;
-				t->max=(uint8_t)max;
-			case 2:
-				if ((delta && !min) || min>255 || min>max) return false;
-				t->min=(uint8_t)min;
-			case 1:
-				if (delta>255) return false;
-				t->delta=(uint8_t)delta;
-				break;
-			default:
-				return false;
+			max = t->max;
+			if (*s=='+')
+			{
+				neg=false;
+				s++;
+			} else if (*s=='-')
+				s++;
+			switch (sscanf(s,"%u:%u-%u",&delta,&min,&max))
+			{
+				case 3:
+					if ((delta && !max) || max>255) return false;
+					t->max=(uint8_t)max;
+				case 2:
+					if ((delta && !min) || min>255 || min>max) return false;
+					t->min=(uint8_t)min;
+				case 1:
+					if (delta>127) return false;
+					t->delta=(int8_t)(neg ? -delta : delta);
+					break;
+				default:
+					return false;
+			}
 		}
 	}
 	return true;
@@ -1003,6 +1098,47 @@ err:
 	return false;
 }
 
+static bool parse_fooling(char *opt, unsigned int *fooling_mode)
+{
+	char *e,*p = opt;
+	while (p)
+	{
+		e = strchr(p,',');
+		if (e) *e++=0;
+		if (!strcmp(p,"md5sig"))
+			*fooling_mode |= FOOL_MD5SIG;
+		else if (!strcmp(p,"ts"))
+			*fooling_mode |= FOOL_TS;
+		else if (!strcmp(p,"badsum"))
+			*fooling_mode |= FOOL_BADSUM;
+		else if (!strcmp(p,"badseq"))
+			*fooling_mode |= FOOL_BADSEQ;
+		else if (!strcmp(p,"datanoack"))
+			*fooling_mode |= FOOL_DATANOACK;
+		else if (!strcmp(p,"hopbyhop"))
+			*fooling_mode |= FOOL_HOPBYHOP;
+		else if (!strcmp(p,"hopbyhop2"))
+			*fooling_mode |= FOOL_HOPBYHOP2;
+		else if (strcmp(p,"none"))
+			return false;
+		p = e;
+	}
+	return true;
+}
+
+static bool parse_strlist(char *opt, struct str_list_head *list)
+{
+	char *e,*p = optarg;
+	while (p)
+	{
+		e = strchr(p,',');
+		if (e) *e++=0;
+		if (*p && !strlist_add(list, p))
+			return false;
+		p = e;
+	}
+	return true;
+}
 
 static void split_compat(struct desync_profile *dp)
 {
@@ -1222,6 +1358,19 @@ static struct blob_item *load_blob_to_collection(const char *filename, struct bl
 	blob->size_buf = blob->size+size_reserve;
 	return blob;
 }
+static struct blob_item *load_const_blob_to_collection(const void *data,size_t sz, struct blob_collection_head *blobs, size_t size_reserve)
+{
+	struct blob_item *blob = blob_collection_add(blobs);
+	if (!blob || (!(blob->data = malloc(sz+size_reserve))))
+	{
+		DLOG_ERR("out of memory\n");
+		exit_clean(1);
+	}
+	blob->size = sz;
+	blob->size_buf = sz+size_reserve;
+	memcpy(blob->data,data,sz);
+	return blob;
+}
 
 
 #ifdef __CYGWIN__
@@ -1300,11 +1449,10 @@ static bool wf_make_filter(
 	const char *pf_tcp_src, const char *pf_tcp_dst,
 	const char *pf_udp_src, const char *pf_udp_dst)
 {
-	char pf_dst_buf[512],iface[64];
+	char pf_dst_buf[8192],iface[64];
 	const char *pf_dst;
 	const char *f_tcpin = *pf_tcp_src ? dp_list_have_autohostlist(&params.desync_profiles) ? "(" DIVERT_TCP_INBOUNDS " or (" DIVERT_HTTP_REDIRECT "))" : DIVERT_TCP_INBOUNDS : "";
-	const char *f_tcp_not_empty = *pf_tcp_src ? DIVERT_TCP_NOT_EMPTY " and " : "";
-
+	const char *f_tcp_not_empty = (*pf_tcp_src && !dp_list_need_all_out(&params.desync_profiles)) ? DIVERT_TCP_NOT_EMPTY " and " : "";
 	snprintf(iface,sizeof(iface)," ifIdx=%u and subIfIdx=%u and",IfIdx,SubIfIdx);
 
 	if (!*pf_tcp_src && !*pf_udp_src) return false;
@@ -1350,7 +1498,11 @@ static void exithelp(void)
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
 		" @<config_file>|$<config_file>\t\t\t; read file for options. must be the only argument. other options are ignored.\n\n"
 #endif
+#ifdef __ANDROID__
+		" --debug=0|1|syslog|android|@<filename>\n"
+#else
 		" --debug=0|1|syslog|@<filename>\n"
+#endif
 		" --version\t\t\t\t\t; print version and exit\n"
 		" --dry-run\t\t\t\t\t; verify parameters and exit with code 0 if successful\n"
 		" --comment=any_text\n"
@@ -1363,13 +1515,16 @@ static void exithelp(void)
 		" --pidfile=<filename>\t\t\t\t; write pid to file\n"
 #ifndef __CYGWIN__
 		" --user=<username>\t\t\t\t; drop root privs\n"
-		" --uid=uid[:gid]\t\t\t\t; drop root privs\n"
+		" --uid=uid[:gid1,gid2,...]\t\t\t; drop root privs\n"
 #endif
 #ifdef __linux__
 		" --bind-fix4\t\t\t\t\t; apply outgoing interface selection fix for generated ipv4 packets\n"
 		" --bind-fix6\t\t\t\t\t; apply outgoing interface selection fix for generated ipv6 packets\n"
 #endif
 		" --ctrack-timeouts=S:E:F[:U]\t\t\t; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default %u:%u:%u:%u\n"
+		" --ctrack-disable=[0|1]\t\t\t\t; 1 or no argument disables conntrack\n"
+		" --ipcache-lifetime=<int>\t\t\t; time in seconds to keep cached hop count and domain name (default %u). 0 = no expiration\n"
+		" --ipcache-hostname=[0|1]\t\t\t; 1 or no argument enables ip->hostname caching\n"
 #ifdef __CYGWIN__
 		"\nWINDIVERT FILTER:\n"
 		" --wf-iface=<int>[.<int>]\t\t\t; numeric network interface and subinterface indexes\n"
@@ -1390,6 +1545,9 @@ static void exithelp(void)
 		" --filter-tcp=[~]port1[-port2]|*\t\t; TCP port filter. ~ means negation. setting tcp and not setting udp filter denies udp. comma separated list allowed.\n"
 		" --filter-udp=[~]port1[-port2]|*\t\t; UDP port filter. ~ means negation. setting udp and not setting tcp filter denies tcp. comma separated list allowed.\n"
 		" --filter-l7=[http|tls|quic|wireguard|dht|discord|stun|unknown] ; L6-L7 protocol filter. multiple comma separated values allowed.\n"
+#ifdef HAS_FILTER_SSID
+		" --filter-ssid=ssid1[,ssid2,ssid3,...]\t\t; per profile wifi SSID filter\n"
+#endif
 		" --ipset=<filename>\t\t\t\t; ipset include filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)\n"
 		" --ipset-ip=<ip_list>\t\t\t\t; comma separated fixed subnet list\n"
 		" --ipset-exclude=<filename>\t\t\t; ipset exclude filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)\n"
@@ -1408,6 +1566,25 @@ static void exithelp(void)
 		" --wsize=<window_size>[:<scale_factor>]\t\t; set window size. 0 = do not modify. OBSOLETE !\n"
 		" --wssize=<window_size>[:<scale_factor>]\t; set window size for server. 0 = do not modify. default scale_factor = 0.\n"
 		" --wssize-cutoff=[n|d|s]N\t\t\t; apply server wsize only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N\n"
+		" --synack-split=[syn|synack|acksyn]\t\t; perform TCP split handshake : send SYN only, SYN+ACK or ACK+SYN\n"
+		" --orig-ttl=<int>\t\t\t\t; set TTL for original packets\n"
+		" --orig-ttl6=<int>\t\t\t\t; set ipv6 hop limit for original packets. by default ttl value is used\n"
+		" --orig-autottl=[<delta>[:<min>[-<max>]]|-]\t; auto ttl mode for both ipv4 and ipv6. default: +%d:%u-%u\n"
+		" --orig-autottl6=[<delta>[:<min>[-<max>]]|-]\t; overrides --orig-autottl for ipv6 only\n"
+		" --orig-mod-start=[n|d|s]N\t\t\t; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N\n"
+		" --orig-mod-cutoff=[n|d|s]N\t\t\t; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N\n"
+		" --dup=<int>\t\t\t\t\t; duplicate original packets. send N dups before original.\n"
+		" --dup-replace=[0|1]\t\t\t\t; 1 or no argument means do not send original, only dups\n"
+		" --dup-ttl=<int>\t\t\t\t; set TTL for dups\n"
+		" --dup-ttl6=<int>\t\t\t\t; set ipv6 hop limit for dups. by default ttl value is used\n"
+		" --dup-autottl=[<delta>[:<min>[-<max>]]|-]\t; auto ttl mode for both ipv4 and ipv6. default: %d:%u-%u\n"
+		" --dup-autottl6=[<delta>[:<min>[-<max>]]|-]\t; overrides --dup-autottl for ipv6 only\n"
+		" --dup-fooling=<mode>[,<mode>]\t\t\t; can use multiple comma separated values. modes : none md5sig badseq badsum datanoack ts hopbyhop hopbyhop2\n"
+		" --dup-ts-increment=<int|0xHEX>\t\t\t; ts fooling TSval signed increment for dup. default %d\n"
+		" --dup-badseq-increment=<int|0xHEX>\t\t; badseq fooling seq signed increment for dup. default %d\n"
+		" --dup-badack-increment=<int|0xHEX>\t\t; badseq fooling ackseq signed increment for dup. default %d\n"
+		" --dup-start=[n|d|s]N\t\t\t\t; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N\n"
+		" --dup-cutoff=[n|d|s]N\t\t\t\t; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N\n"
 		" --hostcase\t\t\t\t\t; change Host: => host:\n"
 		" --hostspell\t\t\t\t\t; exact spelling of \"Host\" header. must be 4 chars. default is \"host\"\n"
 		" --hostnospace\t\t\t\t\t; remove space after Host: and add it to User-Agent: to preserve packet size\n"
@@ -1421,11 +1598,11 @@ static void exithelp(void)
 #elif defined(SO_USER_COOKIE)
 		" --dpi-desync-sockarg=<int|0xHEX>\t\t; override sockarg (SO_USER_COOKIE) for desync packet. default = 0x%08X (%u)\n"
 #endif
-		" --dpi-desync-ttl=<int>\t\t\t\t; set ttl for desync packet\n"
-		" --dpi-desync-ttl6=<int>\t\t\t; set ipv6 hop limit for desync packet. by default ttl value is used.\n"
-		" --dpi-desync-autottl=[<delta>[:<min>[-<max>]]]\t; auto ttl mode for both ipv4 and ipv6. default: %u:%u-%u\n"
-		" --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]] ; overrides --dpi-desync-autottl for ipv6 only\n"
-		" --dpi-desync-fooling=<mode>[,<mode>]\t\t; can use multiple comma separated values. modes : none md5sig ts badseq badsum datanoack hopbyhop hopbyhop2\n"
+		" --dpi-desync-ttl=<int>\t\t\t\t; set ttl for fakes packets\n"
+		" --dpi-desync-ttl6=<int>\t\t\t; set ipv6 hop limit for fake packet. by default --dpi-desync-ttl value is used.\n"
+		" --dpi-desync-autottl=[<delta>[:<min>[-<max>]]|-]  ; auto ttl mode for both ipv4 and ipv6. default: %d:%u-%u\n"
+		" --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]|-] ; overrides --dpi-desync-autottl for ipv6 only\n"
+		" --dpi-desync-fooling=<mode>[,<mode>]\t\t; can use multiple comma separated values. modes : none md5sig badseq badsum datanoack ts hopbyhop hopbyhop2\n"
 		" --dpi-desync-repeats=<N>\t\t\t; send every desync packet N times\n"
 		" --dpi-desync-skip-nosni=0|1\t\t\t; 1(default)=do not act on ClientHello without SNI\n"
 		" --dpi-desync-split-pos=N|-N|marker+N|marker-N\t; comma separated list of split positions\n"
@@ -1437,11 +1614,12 @@ static void exithelp(void)
 		" --dpi-desync-fakedsplit-pattern=<filename>|0xHEX ; fake pattern for fakedsplit/fakeddisorder\n"
 		" --dpi-desync-ipfrag-pos-tcp=<8..%u>\t\t; ip frag position starting from the transport header. multiple of 8, default %u.\n"
 		" --dpi-desync-ipfrag-pos-udp=<8..%u>\t\t; ip frag position starting from the transport header. multiple of 8, default %u.\n"
+		" --dpi-desync-ts-increment=<int|0xHEX>\t\t; ts fooling TSval signed increment. default %d\n"
 		" --dpi-desync-badseq-increment=<int|0xHEX>\t; badseq fooling seq signed increment. default %d\n"
 		" --dpi-desync-badack-increment=<int|0xHEX>\t; badseq fooling ackseq signed increment. default %d\n"
 		" --dpi-desync-any-protocol=0|1\t\t\t; 0(default)=desync only http and tls  1=desync any nonempty data packet\n"
 		" --dpi-desync-fake-http=<filename>|0xHEX\t; file containing fake http request\n"
-		" --dpi-desync-fake-tls=<filename>|0xHEX\t\t; file containing fake TLS ClientHello (for https)\n"
+		" --dpi-desync-fake-tls=<filename>|0xHEX|!\t; file containing fake TLS ClientHello (for https)\n"
 		" --dpi-desync-fake-tls-mod=mod[,mod]\t\t; comma separated list of TLS fake mods. available mods : none,rnd,rndsni,sni=<sni>,dupsid,padencap\n"
 		" --dpi-desync-fake-unknown=<filename>|0xHEX\t; file containing unknown protocol fake payload\n"
 		" --dpi-desync-fake-syndata=<filename>|0xHEX\t; file containing SYN data payload\n"
@@ -1456,21 +1634,25 @@ static void exithelp(void)
 		" --dpi-desync-start=[n|d|s]N\t\t\t; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N\n"
 		" --dpi-desync-cutoff=[n|d|s]N\t\t\t; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N\n",
 		CTRACK_T_SYN, CTRACK_T_EST, CTRACK_T_FIN, CTRACK_T_UDP,
+		IPCACHE_LIFETIME,
 		HOSTLIST_AUTO_FAIL_THRESHOLD_DEFAULT, HOSTLIST_AUTO_FAIL_TIME_DEFAULT, HOSTLIST_AUTO_RETRANS_THRESHOLD_DEFAULT,
+		AUTOTTL_DEFAULT_ORIG_DELTA,AUTOTTL_DEFAULT_ORIG_MIN,AUTOTTL_DEFAULT_ORIG_MAX,
+		AUTOTTL_DEFAULT_DUP_DELTA,AUTOTTL_DEFAULT_DUP_MIN,AUTOTTL_DEFAULT_DUP_MAX,
+		TS_INCREMENT_DEFAULT, BADSEQ_INCREMENT_DEFAULT, BADSEQ_ACK_INCREMENT_DEFAULT,
 #if defined(__linux__) || defined(SO_USER_COOKIE)
 		DPI_DESYNC_FWMARK_DEFAULT,DPI_DESYNC_FWMARK_DEFAULT,
 #endif
-		AUTOTTL_DEFAULT_DELTA,AUTOTTL_DEFAULT_MIN,AUTOTTL_DEFAULT_MAX,
+		AUTOTTL_DEFAULT_DESYNC_DELTA,AUTOTTL_DEFAULT_DESYNC_MIN,AUTOTTL_DEFAULT_DESYNC_MAX,
 		DPI_DESYNC_MAX_FAKE_LEN, IPFRAG_UDP_DEFAULT,
 		DPI_DESYNC_MAX_FAKE_LEN, IPFRAG_TCP_DEFAULT,
-		BADSEQ_INCREMENT_DEFAULT, BADSEQ_ACK_INCREMENT_DEFAULT,
+		TS_INCREMENT_DEFAULT, BADSEQ_INCREMENT_DEFAULT, BADSEQ_ACK_INCREMENT_DEFAULT,
 		UDPLEN_INCREMENT_DEFAULT
 	);
 	exit(1);
 }
 static void exithelp_clean(void)
 {
-	cleanup_params();
+	cleanup_params(&params);
 	exithelp();
 }
 
@@ -1504,16 +1686,19 @@ void config_from_file(const char *filename)
 void check_dp(const struct desync_profile *dp)
 {
 	// only linux has connbytes limiter
-	if (dp->desync_any_proto && !dp->desync_cutoff &&
+	if ((dp->desync_any_proto && !dp->desync_cutoff &&
 		(dp->desync_mode==DESYNC_FAKE || dp->desync_mode==DESYNC_RST || dp->desync_mode==DESYNC_RSTACK ||
 		 dp->desync_mode==DESYNC_FAKEDSPLIT || dp->desync_mode==DESYNC_FAKEDDISORDER || dp->desync_mode2==DESYNC_FAKEDSPLIT || dp->desync_mode2==DESYNC_FAKEDDISORDER))
+		||
+		dp->dup_repeats && !dp->dup_cutoff)
 	{
 #ifdef __linux__
-		DLOG_CONDUP("WARNING !!! in profile %d you are using --dpi-desync-any-protocol without --dpi-desync-cutoff\n", dp->n);
+		DLOG_CONDUP("WARNING !!! in profile %d you are using --dpi-desync-any-protocol without --dpi-desync-cutoff or --dup without --dup-cutoff\n", dp->n);
 		DLOG_CONDUP("WARNING !!! it's completely ok if connbytes or payload based ip/nf tables limiter is applied. Make sure it exists.\n");
 #else
 		DLOG_CONDUP("WARNING !!! possible TRASH FLOOD configuration detected in profile %d\n", dp->n);
-		DLOG_CONDUP("WARNING !!! it's highly recommended to use --dpi-desync-cutoff limiter or fakes will be sent on every processed packet\n");
+		DLOG_CONDUP("WARNING !!! in profile %d you are using --dpi-desync-any-protocol without --dpi-desync-cutoff or --dup without --dup-cutoff\n", dp->n);
+		DLOG_CONDUP("WARNING !!! fakes or dups will be sent on every processed packet\n");
 		DLOG_CONDUP("WARNING !!! make sure it's really what you want\n");
 #ifdef __CYGWIN__
 		DLOG_CONDUP("WARNING !!! in most cases this is acceptable only with custom payload based windivert filter (--wf-raw)\n");
@@ -1525,9 +1710,17 @@ void check_dp(const struct desync_profile *dp)
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
 #if defined(ZAPRET_GH_VER) || defined (ZAPRET_GH_HASH)
+#ifdef __ANDROID__
+#define PRINT_VER printf("github android version %s (%s)\n\n", TOSTRING(ZAPRET_GH_VER), TOSTRING(ZAPRET_GH_HASH))
+#else
 #define PRINT_VER printf("github version %s (%s)\n\n", TOSTRING(ZAPRET_GH_VER), TOSTRING(ZAPRET_GH_HASH))
+#endif
+#else
+#ifdef __ANDROID__
+#define PRINT_VER printf("self-built android version %s %s\n\n", __DATE__, __TIME__)
 #else
 #define PRINT_VER printf("self-built version %s %s\n\n", __DATE__, __TIME__)
+#endif
 #endif
 
 enum opt_indices {
@@ -1549,7 +1742,11 @@ enum opt_indices {
 	IDX_WSIZE,
 	IDX_WSSIZE,
 	IDX_WSSIZE_CUTOFF,
+	IDX_SYNACK_SPLIT,
 	IDX_CTRACK_TIMEOUTS,
+	IDX_CTRACK_DISABLE,
+	IDX_IPCACHE_LIFETIME,
+	IDX_IPCACHE_HOSTNAME,
 	IDX_HOSTCASE,
 	IDX_HOSTSPELL,
 	IDX_HOSTNOSPACE,
@@ -1561,6 +1758,24 @@ enum opt_indices {
 #elif defined(SO_USER_COOKIE)
 	IDX_DPI_DESYNC_SOCKARG,
 #endif
+	IDX_DUP,
+	IDX_DUP_TTL,
+	IDX_DUP_TTL6,
+	IDX_DUP_AUTOTTL,
+	IDX_DUP_AUTOTTL6,
+	IDX_DUP_FOOLING,
+	IDX_DUP_TS_INCREMENT,
+	IDX_DUP_BADSEQ_INCREMENT,
+	IDX_DUP_BADACK_INCREMENT,
+	IDX_DUP_REPLACE,
+	IDX_DUP_START,
+	IDX_DUP_CUTOFF,
+	IDX_ORIG_TTL,
+	IDX_ORIG_TTL6,
+	IDX_ORIG_AUTOTTL,
+	IDX_ORIG_AUTOTTL6,
+	IDX_ORIG_MOD_START,
+	IDX_ORIG_MOD_CUTOFF,
 	IDX_DPI_DESYNC_TTL,
 	IDX_DPI_DESYNC_TTL6,
 	IDX_DPI_DESYNC_AUTOTTL,
@@ -1576,6 +1791,7 @@ enum opt_indices {
 	IDX_DPI_DESYNC_FAKEDSPLIT_PATTERN,
 	IDX_DPI_DESYNC_IPFRAG_POS_TCP,
 	IDX_DPI_DESYNC_IPFRAG_POS_UDP,
+	IDX_DPI_DESYNC_TS_INCREMENT,
 	IDX_DPI_DESYNC_BADSEQ_INCREMENT,
 	IDX_DPI_DESYNC_BADACK_INCREMENT,
 	IDX_DPI_DESYNC_ANY_PROTOCOL,
@@ -1609,6 +1825,9 @@ enum opt_indices {
 	IDX_FILTER_TCP,
 	IDX_FILTER_UDP,
 	IDX_FILTER_L7,
+#ifdef HAS_FILTER_SSID
+	IDX_FILTER_SSID,
+#endif
 	IDX_IPSET,
 	IDX_IPSET_IP,
 	IDX_IPSET_EXCLUDE,
@@ -1649,7 +1868,11 @@ static const struct option long_options[] = {
 	[IDX_WSIZE] = {"wsize", required_argument, 0, 0},
 	[IDX_WSSIZE] = {"wssize", required_argument, 0, 0},
 	[IDX_WSSIZE_CUTOFF] = {"wssize-cutoff", required_argument, 0, 0},
+	[IDX_SYNACK_SPLIT] = {"synack-split", optional_argument, 0, 0},
 	[IDX_CTRACK_TIMEOUTS] = {"ctrack-timeouts", required_argument, 0, 0},
+	[IDX_CTRACK_DISABLE] = {"ctrack-disable", optional_argument, 0, 0},
+	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
+	[IDX_IPCACHE_HOSTNAME] = {"ipcache-hostname", optional_argument, 0, 0},
 	[IDX_HOSTCASE] = {"hostcase", no_argument, 0, 0},
 	[IDX_HOSTSPELL] = {"hostspell", required_argument, 0, 0},
 	[IDX_HOSTNOSPACE] = {"hostnospace", no_argument, 0, 0},
@@ -1661,6 +1884,24 @@ static const struct option long_options[] = {
 #elif defined(SO_USER_COOKIE)
 	[IDX_DPI_DESYNC_SOCKARG] = {"dpi-desync-sockarg", required_argument, 0, 0},
 #endif
+	[IDX_DUP] = {"dup", required_argument, 0, 0},
+	[IDX_DUP_TTL] = {"dup-ttl", required_argument, 0, 0},
+	[IDX_DUP_TTL6] = {"dup-ttl6", required_argument, 0, 0},
+	[IDX_DUP_AUTOTTL] = {"dup-autottl", optional_argument, 0, 0},
+	[IDX_DUP_AUTOTTL6] = {"dup-autottl6", optional_argument, 0, 0},
+	[IDX_DUP_FOOLING] = {"dup-fooling", required_argument, 0, 0},
+	[IDX_DUP_TS_INCREMENT] = {"dup-ts-increment", required_argument, 0, 0},
+	[IDX_DUP_BADSEQ_INCREMENT] = {"dup-badseq-increment", required_argument, 0, 0},
+	[IDX_DUP_BADACK_INCREMENT] = {"dup-badack-increment", required_argument, 0, 0},
+	[IDX_DUP_REPLACE] = {"dup-replace", optional_argument, 0, 0},
+	[IDX_DUP_START] = {"dup-start", required_argument, 0, 0},
+	[IDX_DUP_CUTOFF] = {"dup-cutoff", required_argument, 0, 0},
+	[IDX_ORIG_TTL] = {"orig-ttl", required_argument, 0, 0},
+	[IDX_ORIG_TTL6] = {"orig-ttl6", required_argument, 0, 0},
+	[IDX_ORIG_AUTOTTL] = {"orig-autottl", optional_argument, 0, 0},
+	[IDX_ORIG_AUTOTTL6] = {"orig-autottl6", optional_argument, 0, 0},
+	[IDX_ORIG_MOD_START] = {"orig-mod-start", required_argument, 0, 0},
+	[IDX_ORIG_MOD_CUTOFF] = {"orig-mod-cutoff", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_TTL] = {"dpi-desync-ttl", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_TTL6] = {"dpi-desync-ttl6", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_AUTOTTL] = {"dpi-desync-autottl", optional_argument, 0, 0},
@@ -1676,6 +1917,7 @@ static const struct option long_options[] = {
 	[IDX_DPI_DESYNC_FAKEDSPLIT_PATTERN] = {"dpi-desync-fakedsplit-pattern", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_IPFRAG_POS_TCP] = {"dpi-desync-ipfrag-pos-tcp", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_IPFRAG_POS_UDP] = {"dpi-desync-ipfrag-pos-udp", required_argument, 0, 0},
+	[IDX_DPI_DESYNC_TS_INCREMENT] = {"dpi-desync-ts-increment", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_BADSEQ_INCREMENT] = {"dpi-desync-badseq-increment", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_BADACK_INCREMENT] = {"dpi-desync-badack-increment", required_argument, 0, 0},
 	[IDX_DPI_DESYNC_ANY_PROTOCOL] = {"dpi-desync-any-protocol", optional_argument, 0, 0},
@@ -1709,6 +1951,9 @@ static const struct option long_options[] = {
 	[IDX_FILTER_TCP] = {"filter-tcp", required_argument, 0, 0},
 	[IDX_FILTER_UDP] = {"filter-udp", required_argument, 0, 0},
 	[IDX_FILTER_L7] = {"filter-l7", required_argument, 0, 0},
+#ifdef HAS_FILTER_SSID
+	[IDX_FILTER_SSID] = {"filter-ssid", required_argument, 0, 0},
+#endif
 	[IDX_IPSET] = {"ipset", required_argument, 0, 0},
 	[IDX_IPSET_IP] = {"ipset-ip", required_argument, 0, 0},
 	[IDX_IPSET_EXCLUDE] = {"ipset-exclude", required_argument, 0, 0},
@@ -1744,12 +1989,11 @@ int main(int argc, char **argv)
 #endif
 	int result, v;
 	int option_index = 0;
-	bool daemon = false, bSkip = false, bDry = false;
-	char pidfile[256];
+	bool bSkip = false, bDry = false;
 	struct hostlist_file *anon_hl = NULL, *anon_hl_exclude = NULL;
 	struct ipset_file *anon_ips = NULL, *anon_ips_exclude = NULL;
 #ifdef __CYGWIN__
-	char windivert_filter[8192], wf_pf_tcp_src[256], wf_pf_tcp_dst[256], wf_pf_udp_src[256], wf_pf_udp_dst[256], wf_save_file[256];
+	char windivert_filter[16384], wf_pf_tcp_src[4096], wf_pf_tcp_dst[4096], wf_pf_udp_src[4096], wf_pf_udp_dst[4096], wf_save_file[256];
 	bool wf_ipv4=true, wf_ipv6=true;
 	unsigned int IfIdx=0, SubIfIdx=0;
 	unsigned int hash_wf_tcp=0,hash_wf_udp=0,hash_wf_raw=0,hash_ssid_filter=0,hash_nlm_filter=0;
@@ -1762,7 +2006,6 @@ int main(int argc, char **argv)
 	PRINT_VER;
 
 	memset(&params, 0, sizeof(params));
-	*pidfile = 0;
 
 	struct desync_profile_list *dpl;
 	struct desync_profile *dp;
@@ -1786,7 +2029,8 @@ int main(int argc, char **argv)
 	params.ctrack_t_est = CTRACK_T_EST;
 	params.ctrack_t_fin = CTRACK_T_FIN;
 	params.ctrack_t_udp = CTRACK_T_UDP;
-	
+	params.ipcache_lifetime = IPCACHE_LIFETIME;
+
 	LIST_INIT(&params.hostlists);
 	LIST_INIT(&params.ipsets);
 
@@ -1794,9 +2038,10 @@ int main(int argc, char **argv)
 	LIST_INIT(&params.ssid_filter);
 	LIST_INIT(&params.nlm_filter);
 #else
-	if (can_drop_root()) // are we root ?
+	if (can_drop_root())
 	{
-		params.uid = params.gid = 0x7FFFFFFF; // default uid:gid
+		params.uid = params.gid[0] = 0x7FFFFFFF; // default uid:gid
+		params.gid_count = 1;
 		params.droproot = true;
 	}
 #endif
@@ -1844,10 +2089,22 @@ int main(int argc, char **argv)
 					params.debug_target = LOG_TARGET_SYSLOG;
 					openlog(progname,LOG_PID,LOG_USER);
 				}
+#ifdef __ANDROID__
+				else if (!strcmp(optarg,"android"))
+				{
+					if (!params.debug) params.debug = 1;
+					params.debug_target = LOG_TARGET_ANDROID;
+				}
+#endif
+				else if (optarg[0]>='0' && optarg[0]<='1')
+				{
+					params.debug = atoi(optarg);
+					params.debug_target = LOG_TARGET_CONSOLE;
+				}
 				else
 				{
-					params.debug = !!atoi(optarg);
-					params.debug_target = LOG_TARGET_CONSOLE;
+					fprintf(stderr, "invalid debug mode : %s\n", optarg);
+					exit_clean(1);
 				}
 			}
 			else
@@ -1887,34 +2144,45 @@ int main(int argc, char **argv)
 			break;
 #endif
 		case IDX_DAEMON:
-			daemon = true;
+			params.daemon = true;
 			break;
 		case IDX_PIDFILE:
-			strncpy(pidfile, optarg, sizeof(pidfile));
-			pidfile[sizeof(pidfile) - 1] = '\0';
+			snprintf(params.pidfile,sizeof(params.pidfile),"%s",optarg);
 			break;
 #ifndef __CYGWIN__
 		case IDX_USER:
+		{
+			free(params.user); params.user=NULL;
+			struct passwd *pwd = getpwnam(optarg);
+			if (!pwd)
 			{
-				struct passwd *pwd = getpwnam(optarg);
-				if (!pwd)
-				{
-					DLOG_ERR("non-existent username supplied\n");
-					exit_clean(1);
-				}
-				params.uid = pwd->pw_uid;
-				params.gid = pwd->pw_gid;
-				params.droproot = true;
-			}
-			break;
-		case IDX_UID:
-			params.gid = 0x7FFFFFFF; // default gid. drop gid=0
-			params.droproot = true;
-			if (sscanf(optarg, "%u:%u", &params.uid, &params.gid)<1)
-			{
-				DLOG_ERR("--uid should be : uid[:gid]\n");
+				DLOG_ERR("non-existent username supplied\n");
 				exit_clean(1);
 			}
+			params.uid = pwd->pw_uid;
+			params.gid[0]=pwd->pw_gid;
+			params.gid_count=1;
+			if (!(params.user=strdup(optarg)))
+			{
+				DLOG_ERR("strdup: out of memory\n");
+				exit_clean(1);
+			}
+			params.droproot = true;
+			break;
+		}
+		case IDX_UID:
+			free(params.user); params.user=NULL;
+			if (!parse_uid(optarg,&params.uid,params.gid,&params.gid_count,MAX_GIDS))
+			{
+				DLOG_ERR("--uid should be : uid[:gid,gid,...]\n");
+				exit_clean(1);
+			}
+			if (!params.gid_count)
+			{
+				params.gid[0] = 0x7FFFFFFF;
+				params.gid_count = 1;
+			}
+			params.droproot = true;
 			break;
 #endif
 		case IDX_WSIZE:
@@ -1932,12 +2200,40 @@ int main(int argc, char **argv)
 				exit_clean(1);
 			}
 			break;
+		case IDX_SYNACK_SPLIT:
+			dp->synack_split = SS_SYN;
+			if (optarg)
+			{
+				if (!strcmp(optarg,"synack"))
+					dp->synack_split = SS_SYNACK;
+				else if (!strcmp(optarg,"acksyn"))
+					dp->synack_split = SS_ACKSYN;
+				else if (strcmp(optarg,"syn"))
+				{
+					DLOG_ERR("invalid synack-split value\n");
+					exit_clean(1);
+				}
+			}
+			break;
 		case IDX_CTRACK_TIMEOUTS:
 			if (sscanf(optarg, "%u:%u:%u:%u", &params.ctrack_t_syn, &params.ctrack_t_est, &params.ctrack_t_fin, &params.ctrack_t_udp)<3)
 			{
 				DLOG_ERR("invalid ctrack-timeouts value\n");
 				exit_clean(1);
 			}
+			break;
+		case IDX_CTRACK_DISABLE:
+			params.ctrack_disable = !optarg || atoi(optarg);
+			break;
+		case IDX_IPCACHE_LIFETIME:
+			if (sscanf(optarg, "%u", &params.ipcache_lifetime)!=1)
+			{
+				DLOG_ERR("invalid ipcache-lifetime value\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_IPCACHE_HOSTNAME:
+			params.cache_hostname = !optarg || atoi(optarg);
 			break;
 		case IDX_HOSTCASE:
 			dp->hostcase = true;
@@ -2030,6 +2326,119 @@ int main(int argc, char **argv)
 			}
 			break;
 #endif
+
+		case IDX_DUP:
+			if (sscanf(optarg,"%u",&dp->dup_repeats)<1 || dp->dup_repeats>1024)
+			{
+				DLOG_ERR("dup-repeats must be within 0..1024\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_TTL:
+			dp->dup_ttl = (uint8_t)atoi(optarg);
+			break;
+		case IDX_DUP_TTL6:
+			dp->dup_ttl6 = (uint8_t)atoi(optarg);
+			break;
+		case IDX_DUP_AUTOTTL:
+			if (!parse_autottl(optarg, &dp->dup_autottl, AUTOTTL_DEFAULT_DUP_DELTA, AUTOTTL_DEFAULT_DUP_MIN, AUTOTTL_DEFAULT_DUP_MAX))
+			{
+				DLOG_ERR("dup-autottl value error\n");
+				exit_clean(1);
+			}
+			params.autottl_present=true;
+			break;
+		case IDX_DUP_AUTOTTL6:
+			if (!parse_autottl(optarg, &dp->dup_autottl6, AUTOTTL_DEFAULT_DUP_DELTA, AUTOTTL_DEFAULT_DUP_MIN, AUTOTTL_DEFAULT_DUP_MAX))
+			{
+				DLOG_ERR("dup-autottl6 value error\n");
+				exit_clean(1);
+			}
+			params.autottl_present=true;
+			break;
+		case IDX_DUP_REPLACE:
+			dp->dup_replace = !optarg || atoi(optarg);
+			break;
+		case IDX_DUP_FOOLING:
+			if (!parse_fooling(optarg,&dp->dup_fooling_mode))
+			{
+				DLOG_ERR("fooling allowed values : none,md5sig,ts,badseq,badsum,datanoack,hopbyhop,hopbyhop2\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_TS_INCREMENT:
+			if (!parse_net32_signed(optarg,&dp->dup_ts_increment))
+			{
+				DLOG_ERR("dup-ts-increment should be signed decimal or signed 0xHEX\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_BADSEQ_INCREMENT:
+			if (!parse_net32_signed(optarg,&dp->dup_badseq_increment))
+			{
+				DLOG_ERR("dup-badseq-increment should be signed decimal or signed 0xHEX\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_BADACK_INCREMENT:
+			if (!parse_net32_signed(optarg,&dp->dup_badseq_ack_increment))
+			{
+				DLOG_ERR("dup-badack-increment should be signed decimal or signed 0xHEX\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_CUTOFF:
+			if (!parse_cutoff(optarg, &dp->dup_cutoff, &dp->dup_cutoff_mode))
+			{
+				DLOG_ERR("invalid dup-cutoff value\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_DUP_START:
+			if (!parse_cutoff(optarg, &dp->dup_start, &dp->dup_start_mode))
+			{
+				DLOG_ERR("invalid dup-start value\n");
+				exit_clean(1);
+			}
+			break;
+
+		case IDX_ORIG_TTL:
+			dp->orig_mod_ttl = (uint8_t)atoi(optarg);
+			break;
+		case IDX_ORIG_TTL6:
+			dp->orig_mod_ttl6 = (uint8_t)atoi(optarg);
+			break;
+		case IDX_ORIG_AUTOTTL:
+			if (!parse_autottl(optarg, &dp->orig_autottl, AUTOTTL_DEFAULT_ORIG_DELTA, AUTOTTL_DEFAULT_ORIG_MIN, AUTOTTL_DEFAULT_ORIG_MAX))
+			{
+				DLOG_ERR("orig-autottl value error\n");
+				exit_clean(1);
+			}
+			params.autottl_present=true;
+			break;
+		case IDX_ORIG_AUTOTTL6:
+			if (!parse_autottl(optarg, &dp->orig_autottl6, AUTOTTL_DEFAULT_ORIG_DELTA, AUTOTTL_DEFAULT_ORIG_MIN, AUTOTTL_DEFAULT_ORIG_MAX))
+			{
+				DLOG_ERR("orig-autottl6 value error\n");
+				exit_clean(1);
+			}
+			params.autottl_present=true;
+			break;
+		case IDX_ORIG_MOD_CUTOFF:
+			if (!parse_cutoff(optarg, &dp->orig_mod_cutoff, &dp->orig_mod_cutoff_mode))
+			{
+				DLOG_ERR("invalid orig-mod-cutoff value\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_ORIG_MOD_START:
+			if (!parse_cutoff(optarg, &dp->orig_mod_start, &dp->orig_mod_start_mode))
+			{
+				DLOG_ERR("invalid orig-mod-start value\n");
+				exit_clean(1);
+			}
+			break;
+
 		case IDX_DPI_DESYNC_TTL:
 			dp->desync_ttl = (uint8_t)atoi(optarg);
 			break;
@@ -2037,58 +2446,32 @@ int main(int argc, char **argv)
 			dp->desync_ttl6 = (uint8_t)atoi(optarg);
 			break;
 		case IDX_DPI_DESYNC_AUTOTTL:
-			if (!parse_autottl(optarg, &dp->desync_autottl))
+			if (!parse_autottl(optarg, &dp->desync_autottl, AUTOTTL_DEFAULT_DESYNC_DELTA, AUTOTTL_DEFAULT_DESYNC_MIN, AUTOTTL_DEFAULT_DESYNC_MAX))
 			{
 				DLOG_ERR("dpi-desync-autottl value error\n");
 				exit_clean(1);
 			}
+			params.autottl_present=true;
 			break;
 		case IDX_DPI_DESYNC_AUTOTTL6:
-			if (!parse_autottl(optarg, &dp->desync_autottl6))
+			if (!parse_autottl(optarg, &dp->desync_autottl6, AUTOTTL_DEFAULT_DESYNC_DELTA, AUTOTTL_DEFAULT_DESYNC_MIN, AUTOTTL_DEFAULT_DESYNC_MAX))
 			{
 				DLOG_ERR("dpi-desync-autottl6 value error\n");
 				exit_clean(1);
 			}
+			params.autottl_present=true;
 			break;
 		case IDX_DPI_DESYNC_FOOLING:
+			if (!parse_fooling(optarg,&dp->desync_fooling_mode))
 			{
-				char *e,*p = optarg;
-				while (p)
-				{
-					e = strchr(p,',');
-					if (e) *e++=0;
-					if (!strcmp(p,"md5sig"))
-						dp->desync_fooling_mode |= FOOL_MD5SIG;
-					else if (!strcmp(p,"ts"))
-						dp->desync_fooling_mode |= FOOL_TS;
-					else if (!strcmp(p,"badsum"))
-					{
-						#ifdef __OpenBSD__
-						DLOG_CONDUP("\nWARNING !!! OpenBSD may forcibly recompute tcp/udp checksums !!! In this case badsum fooling will not work.\nYou should check tcp checksum correctness in tcpdump manually before using badsum.\n\n");
-						#endif
-						dp->desync_fooling_mode |= FOOL_BADSUM;
-					}
-					else if (!strcmp(p,"badseq"))
-						dp->desync_fooling_mode |= FOOL_BADSEQ;
-					else if (!strcmp(p,"datanoack"))
-						dp->desync_fooling_mode |= FOOL_DATANOACK;
-					else if (!strcmp(p,"hopbyhop"))
-						dp->desync_fooling_mode |= FOOL_HOPBYHOP;
-					else if (!strcmp(p,"hopbyhop2"))
-						dp->desync_fooling_mode |= FOOL_HOPBYHOP2;
-					else if (strcmp(p,"none"))
-					{
-						DLOG_ERR("dpi-desync-fooling allowed values : none,md5sig,ts,badseq,badsum,datanoack,hopbyhop,hopbyhop2\n");
-						exit_clean(1);
-					}
-					p = e;
-				}
+				DLOG_ERR("fooling allowed values : none,md5sig,ts,badseq,badsum,datanoack,hopbyhop,hopbyhop2\n");
+				exit_clean(1);
 			}
 			break;
 		case IDX_DPI_DESYNC_REPEATS:
-			if (sscanf(optarg,"%u",&dp->desync_repeats)<1 || !dp->desync_repeats || dp->desync_repeats>20)
+			if (sscanf(optarg,"%u",&dp->desync_repeats)<1 || !dp->desync_repeats || dp->desync_repeats>1024)
 			{
-				DLOG_ERR("dpi-desync-repeats must be within 1..20\n");
+				DLOG_ERR("dpi-desync-repeats must be within 1..1024\n");
 				exit_clean(1);
 			}
 			break;
@@ -2189,15 +2572,22 @@ int main(int argc, char **argv)
 				exit_clean(1);
 			}
 			break;
+		case IDX_DPI_DESYNC_TS_INCREMENT:
+			if (!parse_net32_signed(optarg,&dp->desync_ts_increment))
+			{
+				DLOG_ERR("dpi-desync-ts-increment should be signed decimal or signed 0xHEX\n");
+				exit_clean(1);
+			}
+			break;
 		case IDX_DPI_DESYNC_BADSEQ_INCREMENT:
-			if (!parse_badseq_increment(optarg,&dp->desync_badseq_increment))
+			if (!parse_net32_signed(optarg,&dp->desync_badseq_increment))
 			{
 				DLOG_ERR("dpi-desync-badseq-increment should be signed decimal or signed 0xHEX\n");
 				exit_clean(1);
 			}
 			break;
 		case IDX_DPI_DESYNC_BADACK_INCREMENT:
-			if (!parse_badseq_increment(optarg,&dp->desync_badseq_ack_increment))
+			if (!parse_net32_signed(optarg,&dp->desync_badseq_ack_increment))
 			{
 				DLOG_ERR("dpi-desync-badack-increment should be signed decimal or signed 0xHEX\n");
 				exit_clean(1);
@@ -2211,7 +2601,9 @@ int main(int argc, char **argv)
 			break;
 		case IDX_DPI_DESYNC_FAKE_TLS:
 			{
-				dp->tls_fake_last = load_blob_to_collection(optarg, &dp->fake_tls, FAKE_MAX_TCP,4+sizeof(dp->tls_mod_last.sni));
+				dp->tls_fake_last = strcmp(optarg,"!") ?
+					load_blob_to_collection(optarg, &dp->fake_tls, FAKE_MAX_TCP,4+sizeof(dp->tls_mod_last.sni)) :
+					load_const_blob_to_collection(fake_tls_clienthello_default,sizeof(fake_tls_clienthello_default),&dp->fake_tls,4+sizeof(dp->tls_mod_last.sni));
 				if (!(dp->tls_fake_last->extra2 = malloc(sizeof(struct fake_tls_mod))))
 				{
 					DLOG_ERR("out of memory\n");
@@ -2453,6 +2845,16 @@ int main(int argc, char **argv)
 				exit_clean(1);
 			}
 			break;
+#ifdef HAS_FILTER_SSID
+		case IDX_FILTER_SSID:
+			if (!parse_strlist(optarg,&dp->filter_ssid))
+			{
+				DLOG_ERR("strlist_add failed\n");
+				exit_clean(1);
+			}
+			params.filter_ssid_present = true;
+			break;
+#endif
 		case IDX_IPSET:
 			if (bSkip) break;
 			if (!RegisterIpset(dp, false, optarg))
@@ -2557,38 +2959,18 @@ int main(int argc, char **argv)
 			break;
 		case IDX_SSID_FILTER:
 			hash_ssid_filter=hash_jen(optarg,strlen(optarg));
+			if (!parse_strlist(optarg,&params.ssid_filter))
 			{
-				char *e,*p = optarg;
-				while (p)
-				{
-					e = strchr(p,',');
-					if (e) *e++=0;
-					if (*p && !strlist_add(&params.ssid_filter, p))
-					{
-						DLOG_ERR("strlist_add failed\n");
-						exit_clean(1);
-					}
-					p = e;
-
-				}
+				DLOG_ERR("strlist_add failed\n");
+				exit_clean(1);
 			}
 			break;
 		case IDX_NLM_FILTER:
 			hash_nlm_filter=hash_jen(optarg,strlen(optarg));
+			if (!parse_strlist(optarg,&params.nlm_filter))
 			{
-				char *e,*p = optarg;
-				while (p)
-				{
-					e = strchr(p,',');
-					if (e) *e++=0;
-					if (*p && !strlist_add(&params.nlm_filter, p))
-					{
-						DLOG_ERR("strlist_add failed\n");
-						exit_clean(1);
-					}
-					p = e;
-
-				}
+				DLOG_ERR("strlist_add failed\n");
+				exit_clean(1);
 			}
 			break;
 		case IDX_NLM_LIST:
@@ -2613,7 +2995,7 @@ int main(int argc, char **argv)
 
 	// do not need args from file anymore
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
-	cleanup_args();
+	cleanup_args(&params);
 #endif
 	argv=NULL; argc=0;
 	
@@ -2629,7 +3011,86 @@ int main(int argc, char **argv)
 		DLOG_ERR("Need divert port (--port)\n");
 		exit_clean(1);
 	}
-#elif defined(__CYGWIN__)
+#endif
+
+	DLOG("adding low-priority default empty desync profile\n");
+	// add default empty profile
+	if (!(dpl = dp_list_add(&params.desync_profiles)))
+	{
+		DLOG_ERR("desync_profile_add: out of memory\n");
+		exit_clean(1);
+	}
+
+	DLOG_CONDUP("we have %d user defined desync profile(s) and default low priority profile 0\n",desync_profile_count);
+	
+#ifndef __CYGWIN__
+	if (params.debug_target == LOG_TARGET_FILE && params.droproot && chown(params.debug_logfile, params.uid, -1))
+		fprintf(stderr, "could not chown %s. log file may not be writable after privilege drop\n", params.debug_logfile);
+	if (params.droproot && *params.hostlist_auto_debuglog && chown(params.hostlist_auto_debuglog, params.uid, -1))
+		DLOG_ERR("could not chown %s. auto hostlist debug log may not be writable after privilege drop\n", params.hostlist_auto_debuglog);
+#endif
+	LIST_FOREACH(dpl, &params.desync_profiles, next)
+	{
+		dp = &dpl->dp;
+		// not specified - use desync_ttl value instead
+		if (dp->desync_ttl6 == 0xFF) dp->desync_ttl6=dp->desync_ttl;
+		if (dp->dup_ttl6 == 0xFF) dp->dup_ttl6=dp->dup_ttl;
+		if (dp->orig_mod_ttl6 == 0xFF) dp->orig_mod_ttl6=dp->orig_mod_ttl;
+		if (!AUTOTTL_ENABLED(dp->desync_autottl6)) dp->desync_autottl6 = dp->desync_autottl;
+		if (!AUTOTTL_ENABLED(dp->orig_autottl6)) dp->orig_autottl6 = dp->orig_autottl;
+		if (!AUTOTTL_ENABLED(dp->dup_autottl6)) dp->dup_autottl6 = dp->dup_autottl;
+		if (AUTOTTL_ENABLED(dp->desync_autottl))
+			DLOG("profile %d desync autottl ipv4 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->desync_autottl.delta),dp->desync_autottl.delta,dp->desync_autottl.min,dp->desync_autottl.max);
+		if (AUTOTTL_ENABLED(dp->desync_autottl6))
+			DLOG("profile %d desync autottl ipv6 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->desync_autottl6.delta),dp->desync_autottl6.delta,dp->desync_autottl6.min,dp->desync_autottl6.max);
+		if (AUTOTTL_ENABLED(dp->orig_autottl))
+			DLOG("profile %d orig autottl ipv4 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->orig_autottl.delta),dp->orig_autottl.delta,dp->orig_autottl.min,dp->orig_autottl.max);
+		if (AUTOTTL_ENABLED(dp->orig_autottl6))
+			DLOG("profile %d orig autottl ipv6 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->orig_autottl6.delta),dp->orig_autottl6.delta,dp->orig_autottl6.min,dp->orig_autottl6.max);
+		if (AUTOTTL_ENABLED(dp->dup_autottl))
+			DLOG("profile %d dup autottl ipv4 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->dup_autottl.delta),dp->dup_autottl.delta,dp->dup_autottl.min,dp->dup_autottl.max);
+		if (AUTOTTL_ENABLED(dp->dup_autottl6))
+			DLOG("profile %d dup autottl ipv6 %s%d:%u-%u\n",dp->n,UNARY_PLUS(dp->dup_autottl6.delta),dp->dup_autottl6.delta,dp->dup_autottl6.min,dp->dup_autottl6.max);
+		split_compat(dp);
+		if (!dp_fake_defaults(dp))
+		{
+			DLOG_ERR("could not fill fake defaults\n");
+			exit_clean(1);
+		}
+		if (!onetime_tls_mod(dp))
+		{
+			DLOG_ERR("could not mod tls\n");
+			exit_clean(1);
+		}
+#ifndef __CYGWIN__
+		if (params.droproot && dp->hostlist_auto && chown(dp->hostlist_auto->filename, params.uid, -1))
+			DLOG_ERR("could not chown %s. auto hostlist file may not be writable after privilege drop\n", dp->hostlist_auto->filename);
+#endif
+	}
+
+	if (!test_list_files())
+		exit_clean(1);
+
+	if (!LoadAllHostLists())
+	{
+		DLOG_ERR("hostlists load failed\n");
+		exit_clean(1);
+	}
+	if (!LoadAllIpsets())
+	{
+		DLOG_ERR("ipset load failed\n");
+		exit_clean(1);
+	}
+	
+	DLOG("\nlists summary:\n");
+	HostlistsDebug();
+	IpsetsDebug();
+
+	DLOG("\nsplits summary:\n");
+	SplitDebug();
+	DLOG("\n");
+
+#ifdef __CYGWIN__
 	if (!*windivert_filter)
 	{
 		if (!*wf_pf_tcp_src && !*wf_pf_udp_src)
@@ -2669,88 +3130,37 @@ int main(int argc, char **argv)
 			DLOG_ERR("A copy of winws is already running with the same filter\n");
 			goto exiterr;
 		}
-		
 	}
 #endif
-
-	DLOG("adding low-priority default empty desync profile\n");
-	// add default empty profile
-	if (!(dpl = dp_list_add(&params.desync_profiles)))
-	{
-		DLOG_ERR("desync_profile_add: out of memory\n");
-		exit_clean(1);
-	}
-
-	DLOG_CONDUP("we have %d user defined desync profile(s) and default low priority profile 0\n",desync_profile_count);
-	
-#ifndef __CYGWIN__
-	if (params.debug_target == LOG_TARGET_FILE && params.droproot && chown(params.debug_logfile, params.uid, -1))
-		fprintf(stderr, "could not chown %s. log file may not be writable after privilege drop\n", params.debug_logfile);
-	if (params.droproot && *params.hostlist_auto_debuglog && chown(params.hostlist_auto_debuglog, params.uid, -1))
-		DLOG_ERR("could not chown %s. auto hostlist debug log may not be writable after privilege drop\n", params.hostlist_auto_debuglog);
-#endif
-	LIST_FOREACH(dpl, &params.desync_profiles, next)
-	{
-		dp = &dpl->dp;
-		// not specified - use desync_ttl value instead
-		if (dp->desync_ttl6 == 0xFF) dp->desync_ttl6=dp->desync_ttl;
-		if (!AUTOTTL_ENABLED(dp->desync_autottl6)) dp->desync_autottl6 = dp->desync_autottl;
-		if (AUTOTTL_ENABLED(dp->desync_autottl))
-			DLOG("profile %d autottl ipv4 %u:%u-%u\n",dp->n,dp->desync_autottl.delta,dp->desync_autottl.min,dp->desync_autottl.max);
-		if (AUTOTTL_ENABLED(dp->desync_autottl6))
-			DLOG("profile %d autottl ipv6 %u:%u-%u\n",dp->n,dp->desync_autottl6.delta,dp->desync_autottl6.min,dp->desync_autottl6.max);
-		split_compat(dp);
-		if (!dp_fake_defaults(dp))
-		{
-			DLOG_ERR("could not fill fake defaults\n");
-			exit_clean(1);
-		}
-		if (!onetime_tls_mod(dp))
-		{
-			DLOG_ERR("could not mod tls\n");
-			exit_clean(1);
-		}
-#ifndef __CYGWIN__
-		if (params.droproot && dp->hostlist_auto && chown(dp->hostlist_auto->filename, params.uid, -1))
-			DLOG_ERR("could not chown %s. auto hostlist file may not be writable after privilege drop\n", dp->hostlist_auto->filename);
-#endif
-	}
-
-	if (!LoadAllHostLists())
-	{
-		DLOG_ERR("hostlists load failed\n");
-		exit_clean(1);
-	}
-	if (!LoadAllIpsets())
-	{
-		DLOG_ERR("ipset load failed\n");
-		exit_clean(1);
-	}
-	
-	DLOG("\nlists summary:\n");
-	HostlistsDebug();
-	IpsetsDebug();
-
-	DLOG("\nsplits summary:\n");
-	SplitDebug();
-	DLOG("\n");
 
 	if (bDry)
 	{
+#ifndef __CYGWIN__
+		if (params.droproot)
+		{
+			if (!droproot(params.uid,params.user,params.gid,params.gid_count))
+				exit_clean(1);
+#ifdef __linux__
+			if (!dropcaps())
+				exit_clean(1);
+#endif
+			print_id();
+			if (!test_list_files())
+				exit_clean(1);
+		}
+#endif
 		DLOG_CONDUP("command line parameters verified\n");
 		exit_clean(0);
 	}
 
-	if (daemon) daemonize();
-
-	if (*pidfile && !writepid(pidfile))
+	if (params.ctrack_disable)
+		DLOG_CONDUP("conntrack disabled ! some functions will not work. make sure it's what you want.\n");
+	else
 	{
-		DLOG_ERR("could not write pidfile\n");
-		goto exiterr;
+		DLOG("initializing conntrack with timeouts tcp=%u:%u:%u udp=%u\n", params.ctrack_t_syn, params.ctrack_t_est, params.ctrack_t_fin, params.ctrack_t_udp);
+		ConntrackPoolInit(&params.conntrack, 10, params.ctrack_t_syn, params.ctrack_t_est, params.ctrack_t_fin, params.ctrack_t_udp);
 	}
-
-	DLOG("initializing conntrack with timeouts tcp=%u:%u:%u udp=%u\n", params.ctrack_t_syn, params.ctrack_t_est, params.ctrack_t_fin, params.ctrack_t_udp);
-	ConntrackPoolInit(&params.conntrack, 10, params.ctrack_t_syn, params.ctrack_t_est, params.ctrack_t_fin, params.ctrack_t_udp);
+	if (params.autottl_present || params.cache_hostname) DLOG("ipcache lifetime %us\n", params.ipcache_lifetime);
 
 #ifdef __linux__
 	result = nfq_main();
@@ -2763,7 +3173,7 @@ int main(int argc, char **argv)
 #endif
 ex:
 	rawsend_cleanup();
-	cleanup_params();
+	cleanup_params(&params);
 #ifdef __CYGWIN__
 	if (hMutexArg)
 	{

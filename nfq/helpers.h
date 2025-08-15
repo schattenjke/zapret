@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#define UNARY_PLUS(v) (v>0 ? "+" : "")
+
 // this saves memory. sockaddr_storage is larger than required. it can be 128 bytes. sockaddr_in6 is 28 bytes.
 typedef union
 {
@@ -28,6 +30,10 @@ bool load_file(const char *filename,void *buffer,size_t *buffer_size);
 bool load_file_nonempty(const char *filename,void *buffer,size_t *buffer_size);
 bool save_file(const char *filename, const void *buffer, size_t buffer_size);
 bool append_to_list_file(const char *filename, const char *s);
+
+void expand_bits(void *target, const void *source, unsigned int source_bitlen, unsigned int target_bytelen);
+
+bool strip_host_to_ip(char *host);
 
 void print_sockaddr(const struct sockaddr *sa);
 void ntop46(const struct sockaddr *sa, char *str, size_t len);

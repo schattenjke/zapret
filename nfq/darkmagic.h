@@ -1,5 +1,6 @@
 #pragma once
 
+#include "nfqws.h"
 #include "checksum.h"
 #include "packet_queue.h"
 #include "pools.h"
@@ -59,6 +60,7 @@ uint32_t net16_add(uint16_t netorder_value, uint16_t cpuorder_increment);
 #define VERDICT_DROP	2
 #define VERDICT_MASK	3
 #define VERDICT_NOCSUM	4
+#define VERDICT_GARBAGE	8
 
 #define IP4_TOS(ip_header) (ip_header ? ip_header->ip_tos : 0)
 #define IP4_IP_ID(ip_header) (ip_header ? ip_header->ip_id : 0)
@@ -68,14 +70,18 @@ uint32_t net16_add(uint16_t netorder_value, uint16_t cpuorder_increment);
 bool prepare_tcp_segment4(
 	const struct sockaddr_in *src, const struct sockaddr_in *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
 	uint32_t *timestamps,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
@@ -83,6 +89,8 @@ bool prepare_tcp_segment4(
 bool prepare_tcp_segment6(
 	const struct sockaddr_in6 *src, const struct sockaddr_in6 *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
@@ -90,6 +98,7 @@ bool prepare_tcp_segment6(
 	uint8_t ttl,
 	uint32_t flow_label,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
@@ -97,15 +106,19 @@ bool prepare_tcp_segment6(
 bool prepare_tcp_segment(
 	const struct sockaddr *src, const struct sockaddr *dst,
 	uint8_t tcp_flags,
+	bool sack,
+	uint16_t nmss,
 	uint32_t nseq, uint32_t nack_seq,
 	uint16_t nwsize,
 	uint8_t scale_factor,
 	uint32_t *timestamps,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
 	uint32_t flow_label,
 	uint32_t fooling,
+	uint32_t ts_increment,
 	uint32_t badseq_increment,
 	uint32_t badseq_ack_increment,
 	const void *data, uint16_t len,
@@ -114,6 +127,7 @@ bool prepare_tcp_segment(
 
 bool prepare_udp_segment4(
 	const struct sockaddr_in *src, const struct sockaddr_in *dst,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
@@ -133,6 +147,7 @@ bool prepare_udp_segment6(
 	uint8_t *buf, size_t *buflen);
 bool prepare_udp_segment(
 	const struct sockaddr *src, const struct sockaddr *dst,
+	bool DF,
 	uint8_t ttl,
 	uint8_t tos,
 	uint16_t ip_id,
@@ -162,14 +177,19 @@ bool ip_frag(
 	uint8_t *pkt1, size_t *pkt1_size,
 	uint8_t *pkt2, size_t *pkt2_size);
 	
-void rewrite_ttl(struct ip *ip, struct ip6_hdr *ip6, uint8_t ttl);
+bool rewrite_ttl(struct ip *ip, struct ip6_hdr *ip6, uint8_t ttl);
 
 void extract_ports(const struct tcphdr *tcphdr, const struct udphdr *udphdr, uint8_t *proto, uint16_t *sport, uint16_t *dport);
 void extract_endpoints(const struct ip *ip,const struct ip6_hdr *ip6hdr,const struct tcphdr *tcphdr,const struct udphdr *udphdr, struct sockaddr_storage *src, struct sockaddr_storage *dst);
 uint8_t *tcp_find_option(struct tcphdr *tcp, uint8_t kind);
 uint32_t *tcp_find_timestamps(struct tcphdr *tcp);
 uint8_t tcp_find_scale_factor(const struct tcphdr *tcp);
+uint16_t tcp_find_mss(struct tcphdr *tcp);
+bool tcp_has_sack(struct tcphdr *tcp);
+
 bool tcp_has_fastopen(const struct tcphdr *tcp);
+
+bool ip_has_df(const struct ip *ip);
 
 #ifdef __CYGWIN__
 extern uint32_t w_win32_error;
@@ -242,15 +262,13 @@ void tcp_rewrite_winsize(struct tcphdr *tcp, uint16_t winsize, uint8_t scale_fac
 
 typedef struct
 {
-	uint8_t delta, min, max;
+	int8_t delta;
+	uint8_t min, max;
 } autottl;
-#define AUTOTTL_DEFAULT_DELTA 1
-#define AUTOTTL_DEFAULT_MIN 3
-#define AUTOTTL_DEFAULT_MAX 20
-#define AUTOTTL_ENABLED(a) (!!(a).delta)
-#define AUTOTTL_SET_DEFAULT(a) {(a).delta=AUTOTTL_DEFAULT_DELTA; (a).min=AUTOTTL_DEFAULT_MIN; (a).max=AUTOTTL_DEFAULT_MAX;}
+#define AUTOTTL_ENABLED(a) ((a).delta || (a).min || (a).max)
 
-uint8_t autottl_guess(uint8_t ttl, const autottl *attl);
+uint8_t hop_count_guess(uint8_t ttl);
+uint8_t autottl_eval(uint8_t hop_count, const autottl *attl);
 void do_nat(bool bOutbound, struct ip *ip, struct ip6_hdr *ip6, struct tcphdr *tcphdr, struct udphdr *udphdr, const struct sockaddr_in *target4, const struct sockaddr_in6 *target6);
 
 void verdict_tcp_csum_fix(uint8_t verdict, struct tcphdr *tcphdr, size_t transport_len, struct ip *ip, struct ip6_hdr *ip6hdr);
@@ -258,3 +276,29 @@ void verdict_udp_csum_fix(uint8_t verdict, struct udphdr *udphdr, size_t transpo
 
 void dbgprint_socket_buffers(int fd);
 bool set_socket_buffers(int fd, int rcvbuf, int sndbuf);
+
+
+#ifdef HAS_FILTER_SSID
+
+struct wlan_interface
+{
+	int ifindex;
+	char ifname[IFNAMSIZ], ssid[33];
+};
+#define WLAN_INTERFACE_MAX 16
+struct wlan_interface_collection
+{
+	int count;
+	struct wlan_interface wlan[WLAN_INTERFACE_MAX];
+};
+
+extern struct wlan_interface_collection wlans;
+
+void wlan_info_deinit(void);
+bool wlan_info_init(void);
+bool wlan_info_get(void);
+bool wlan_info_get_rate_limited(void);
+const char *wlan_ssid_search_ifname(const char *ifname);
+const char *wlan_ssid_search_ifidx(int ifidx);
+
+#endif

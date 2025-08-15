@@ -1,9 +1,11 @@
-CC ?= gcc
-CFLAGS += -std=gnu99 -Os -flto=auto
+CC ?= cc
+OPTIMIZE ?= -Os
+CFLAGS += -std=gnu99 $(OPTIMIZE) -flto=auto
 CFLAGS_SYSTEMD = -DUSE_SYSTEMD
 CFLAGS_BSD = -Wno-address-of-packed-member
 CFLAGS_CYGWIN = -Wno-address-of-packed-member -static
-LIBS_LINUX = -lnetfilter_queue -lnfnetlink -lz
+LDFLAGS_ANDROID = -llog
+LIBS_LINUX = -lz -lnetfilter_queue -lnfnetlink -lmnl
 LIBS_SYSTEMD = -lsystemd
 LIBS_BSD = -lz
 LIBS_CYGWIN = -lz -Lwindows/windivert -Iwindows -lwlanapi -lole32 -loleaut32
@@ -21,7 +23,8 @@ nfqws: $(SRC_FILES)
 systemd: $(SRC_FILES)
 	$(CC) -s $(CFLAGS) $(CFLAGS_SYSTEMD) -o nfqws $(SRC_FILES) $(LIBS_LINUX) $(LIBS_SYSTEMD) $(LDFLAGS)
 
-android: nfqws
+android: $(SRC_FILES)
+	$(CC) -s $(CFLAGS) -o nfqws $(SRC_FILES) $(LIBS_LINUX) $(LDFLAGS) $(LDFLAGS_ANDROID)
 
 bsd: $(SRC_FILES)
 	$(CC) -s $(CFLAGS) $(CFLAGS_BSD) -o dvtws $(SRC_FILES) $(LIBS_BSD) $(LDFLAGS)

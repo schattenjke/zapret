@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <sys/queue.h>
+#include <net/if.h>
 #include <time.h>
 
 #include "helpers.h"
@@ -11,6 +12,8 @@
 #define HASH_NONFATAL_OOM 1
 #define HASH_FUNCTION HASH_BER
 #include "uthash.h"
+
+#include "kavl.h"
 
 #define HOSTLIST_POOL_FLAG_STRICT_MATCH		1
 
@@ -31,6 +34,11 @@ struct str_list {
 };
 LIST_HEAD(str_list_head, str_list);
 
+bool strlist_add(struct str_list_head *head, const char *filename);
+void strlist_destroy(struct str_list_head *head);
+bool strlist_search(const struct str_list_head *head, const char *str);
+
+
 typedef struct hostfail_pool {
 	char *str;		/* key */
 	int counter;	/* value */
@@ -45,10 +53,6 @@ void HostFailPoolDel(hostfail_pool **pp, hostfail_pool *elem);
 void HostFailPoolPurge(hostfail_pool **pp);
 void HostFailPoolPurgeRateLimited(hostfail_pool **pp);
 void HostFailPoolDump(hostfail_pool *p);
-
-bool strlist_add(struct str_list_head *head, const char *filename);
-void strlist_destroy(struct str_list_head *head);
-
 
 
 struct hostlist_file {
@@ -75,39 +79,40 @@ struct hostlist_item *hostlist_collection_search(struct hostlist_collection_head
 bool hostlist_collection_is_empty(const struct hostlist_collection_head *head);
 
 
-typedef struct ipset4 {
-	struct cidr4 cidr;	/* key */
-	UT_hash_handle hh;	/* makes this structure hashable */
-} ipset4;
-typedef struct ipset6 {
-	struct cidr6 cidr;	/* key */
-	UT_hash_handle hh;	/* makes this structure hashable */
-} ipset6;
+struct kavl_bit_elem
+{
+	unsigned int bitlen;
+	uint8_t *data;
+	KAVL_HEAD(struct kavl_bit_elem) head;
+};
+
+struct kavl_bit_elem *kavl_bit_get(const struct kavl_bit_elem *hdr, const void *data, unsigned int bitlen);
+struct kavl_bit_elem *kavl_bit_add(struct kavl_bit_elem **hdr, void *data, unsigned int bitlen, size_t struct_size);
+void kavl_bit_delete(struct kavl_bit_elem **hdr, const void *data, unsigned int bitlen);
+void kavl_bit_destroy(struct kavl_bit_elem **hdr);
+
 // combined ipset ipv4 and ipv6
 typedef struct ipset {
-	ipset4 *ips4;
-	ipset6 *ips6;
+	struct kavl_bit_elem *ips4,*ips6;
 } ipset;
 
 #define IPSET_EMPTY(ips) (!(ips)->ips4 && !(ips)->ips6)
 
-void ipset4Destroy(ipset4 **ipset);
-bool ipset4Add(ipset4 **ipset, const struct in_addr *a, uint8_t preflen);
-static inline bool ipset4AddCidr(ipset4 **ipset, const struct cidr4 *cidr)
+bool ipset4Add(struct kavl_bit_elem **ipset, const struct in_addr *a, uint8_t preflen);
+static inline bool ipset4AddCidr(struct kavl_bit_elem **ipset, const struct cidr4 *cidr)
 {
 	return ipset4Add(ipset,&cidr->addr,cidr->preflen);
 }
-bool ipset4Check(ipset4 *ipset, const struct in_addr *a, uint8_t preflen);
-void ipset4Print(ipset4 *ipset);
+bool ipset4Check(const struct kavl_bit_elem *ipset, const struct in_addr *a, uint8_t preflen);
+void ipset4Print(struct kavl_bit_elem *ipset);
 
-void ipset6Destroy(ipset6 **ipset);
-bool ipset6Add(ipset6 **ipset, const struct in6_addr *a, uint8_t preflen);
-static inline bool ipset6AddCidr(ipset6 **ipset, const struct cidr6 *cidr)
+bool ipset6Add(struct kavl_bit_elem **ipset, const struct in6_addr *a, uint8_t preflen);
+static inline bool ipset6AddCidr(struct kavl_bit_elem **ipset, const struct cidr6 *cidr)
 {
 	return ipset6Add(ipset,&cidr->addr,cidr->preflen);
 }
-bool ipset6Check(ipset6 *ipset, const struct in6_addr *a, uint8_t preflen);
-void ipset6Print(ipset6 *ipset);
+bool ipset6Check(const struct kavl_bit_elem *ipset, const struct in6_addr *a, uint8_t preflen);
+void ipset6Print(struct kavl_bit_elem *ipset);
 
 void ipsetDestroy(ipset *ipset);
 void ipsetPrint(ipset *ipset);
@@ -161,3 +166,44 @@ struct blob_item *blob_collection_add(struct blob_collection_head *head);
 struct blob_item *blob_collection_add_blob(struct blob_collection_head *head, const void *data, size_t size, size_t size_reserve);
 void blob_collection_destroy(struct blob_collection_head *head);
 bool blob_collection_empty(const struct blob_collection_head *head);
+
+
+typedef struct ip4if
+{
+	char iface[IFNAMSIZ];
+	struct in_addr addr;
+} ip4if;
+typedef struct ip6if
+{
+	char iface[IFNAMSIZ];
+	struct in6_addr addr;
+} ip6if;
+typedef struct ip_cache_item
+{
+	time_t last;
+	char *hostname;
+	bool hostname_is_ip;
+	uint8_t hops;
+} ip_cache_item;
+typedef struct ip_cache4
+{
+	ip4if key;
+	ip_cache_item data;
+	UT_hash_handle hh;	/* makes this structure hashable */
+} ip_cache4;
+typedef struct ip_cache6
+{
+	ip6if key;
+	ip_cache_item data;
+	UT_hash_handle hh;	/* makes this structure hashable */
+} ip_cache6;
+typedef struct ip_cache
+{
+	ip_cache4 *ipcache4;
+	ip_cache6 *ipcache6;
+} ip_cache;
+
+ip_cache_item *ipcacheTouch(ip_cache *ipcache, const struct in_addr *a4, const struct in6_addr *a6, const char *iface);
+void ipcachePurgeRateLimited(ip_cache *ipcache, time_t lifetime);
+void ipcacheDestroy(ip_cache *ipcache);
+void ipcachePrint(ip_cache *ipcache);
