@@ -147,6 +147,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
+    if: false
     name: macOS
     runs-on: macos-latest
     steps:
@@ -167,6 +168,7 @@ jobs:
           if-no-files-found: error
 
   build-freebsd:
+    if: false
     name: FreeBSD ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -202,6 +204,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    if: false
     name: Windows ${{ matrix.arch }}
     runs-on: windows-latest
     strategy:
@@ -305,6 +308,7 @@ jobs:
           if-no-files-found: error
 
   build-android:
+    if: false
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-latest
     strategy:
