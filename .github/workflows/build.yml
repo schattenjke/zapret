@@ -382,7 +382,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [ build-linux, build-windows, build-macos, build-freebsd, build-android ]
+    needs: [ build-linux ]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -462,6 +462,17 @@ jobs:
             fi
           done
           ls -lhR
+
+      - name: Push binaries to repo
+        run: |
+          cd ${{ env.repo_dir }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git status
+          git add .
+          git commit -m "Added binaries"
+          git fetch origin master
+          git push origin HEAD:master     
 
       - name: Create release bundles
         run: |
