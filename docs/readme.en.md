@@ -1,4 +1,4 @@
-# zapret v71.3
+# zapret v72.2
 
 # SCAMMER WARNING
 
@@ -23,6 +23,7 @@ ___
   - [Fake mods](#fake-mods)
   - [TCP segmentation](#tcp-segmentation)
   - [Sequence numbers overlap](#sequence-numbers-overlap)
+  - [IP_ID assignment](#ip_id-assignment)
   - [ipv6 specific modes](#ipv6-specific-modes)
   - [Original modding](#original-modding)
   - [Duplicates](#duplicates)
@@ -136,108 +137,125 @@ For BSD systems there is dvtws. Its built from the same source and has almost th
 nfqws takes the following parameters:
 
 ```
- @<config_file>					; read file for options. must be the only argument. other options are ignored.
+ @<config_file>                                            ; read file for options. must be the only argument. other options are ignored.
 
  --debug=0|1
- --dry-run                                      ; verify parameters and exit with code 0 if successful
- --version                                      ; print version and exit
- --comment                                      ; any text (ignored)
+ --dry-run                                                 ; verify parameters and exit with code 0 if successful
+ --version                                                 ; print version and exit
+ --comment                                                 ; any text (ignored)
  --qnum=<nfqueue_number>
- --daemon                                       ; daemonize
- --pidfile=<filename>                           ; write pid to file
- --user=<username>                              ; drop root privs
- --uid=uid[:gid1,gid2,...]                      ; drop root privs
- --bind-fix4                                    ; apply outgoing interface selection fix for generated ipv4 packets
- --bind-fix6                                    ; apply outgoing interface selection fix for generated ipv6 packets
- --wsize=<window_size>[:<scale_factor>]         ; set window size. 0 = do not modify. OBSOLETE !
- --wssize=<window_size>[:<scale_factor>]        ; set window size for server. 0 = do not modify. default scale_factor = 0.
- --wssize-cutoff=[n|d|s]N                       ; apply server wsize only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
- --ctrack-timeouts=S:E:F[:U]                    ; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default 60:300:60:60
- --ctrack-disable=[0|1]                         ; 1 or no argument disables conntrack
- --ipcache-lifetime=<int>                       ; time in seconds to keep cached hop count and domain name (default 7200). 0 = no expiration
- --ipcache-hostname=[0|1]                       ; 1 or no argument enables ip->hostname caching
- --hostcase                                     ; change Host: => host:
- --hostspell                                    ; exact spelling of "Host" header. must be 4 chars. default is "host"
- --hostnospace                                  ; remove space after Host: and add it to User-Agent: to preserve packet size
- --domcase                                      ; mix domain case : Host: TeSt.cOm
- --methodeol					; add '\n' before method and remove space after Host:
- --synack-split=[syn|synack|acksyn]             ; perform TCP split handshake : send SYN only, SYN+ACK or ACK+SYN
- --orig-ttl=<int>                               ; set TTL for original packets
- --orig-ttl6=<int>                              ; set ipv6 hop limit for original packets. by default ttl value is used
- --orig-autottl=[<delta>[:<min>[-<max>]]|-]     ; auto ttl mode for both ipv4 and ipv6. default: +5:3-64. "0:0-0" or "-" disables autottl.
- --orig-autottl6=[<delta>[:<min>[-<max>]]|-]    ; overrides --orig-autottl for ipv6 only
- --orig-mod-start=[n|d|s]N                      ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
- --orig-mod-cutoff=[n|d|s]N                     ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
- --dup=<int>                                    ; duplicate original packets. send N dups before original.
- --dup-replace=[0|1]                            ; 1 or no argument means do not send original, only dups
- --dup-ttl=<int>                                ; set TTL for dups
- --dup-ttl6=<int>                               ; set ipv6 hop limit for dups. by default ttl value is used
- --dup-autottl=[<delta>[:<min>[-<max>]]|-]      ; auto ttl mode for both ipv4 and ipv6. default: -1:3-64. "0:0-0" or "-" disables autottl.
- --dup-autottl6=[<delta>[:<min>[-<max>]]|-]     ; overrides --dup-autottl for ipv6 only
- --dup-fooling=<mode>[,<mode>]                  ; can use multiple comma separated values. modes : none md5sig badseq badsum datanoack hopbyhop hopbyhop2
- --dup-ts-increment=<int|0xHEX>                 ; ts fooling TSval signed increment for dup. default -600000
- --dup-badseq-increment=<int|0xHEX>             ; badseq fooling seq signed increment for dup. default -10000
- --dup-badack-increment=<int|0xHEX>             ; badseq fooling ackseq signed increment for dup. default -66000
- --dup-start=[n|d|s]N                           ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
- --dup-cutoff=[n|d|s]N                          ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
- --dpi-desync=[<mode0>,]<mode>[,<mode2>]        ; try to desync dpi state. modes : synack fake fakeknown rst rstack hopbyhop destopt ipfrag1 multisplit multidisorder fakedsplit fakeddisorder ipfrag2 udplen tamper
- --dpi-desync-fwmark=<int|0xHEX>                ; override fwmark for desync packet. default = 0x40000000 (1073741824)
- --dpi-desync-ttl=<int>                         ; set ttl for desync packet
- --dpi-desync-ttl6=<int>                        ; set ipv6 hop limit for desync packet. by default ttl value is used.
- --dpi-desync-autottl=[<delta>[:<min>[-<max>]]|-]  ; auto ttl mode for both ipv4 and ipv6. default: -1:3-20. "0:0-0" or "-" disables autottl.
- --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]|-] ; overrides --dpi-desync-autottl for ipv6 only
- --dpi-desync-fooling=<mode>[,<mode>]           ; can use multiple comma separated values. modes : none md5sig ts badseq badsum datanoack hopbyhop hopbyhop2
- --dpi-desync-repeats=<N>                       ; send every desync packet N times
- --dpi-desync-skip-nosni=0|1                    ; 1(default)=do not act on ClientHello without SNI (ESNI ?)
- --dpi-desync-split-pos=N|-N|marker+N|marker-N  ; comma separated list of split positions
-                                                ; markers: method,host,endhost,sld,endsld,midsld,sniext
-                                                ; full list is only used by multisplit and multidisorder
-                                                ; fakedsplit/fakeddisorder use first l7-protocol-compatible parameter if present, first abs value otherwise
- --dpi-desync-split-seqovl=N|-N|marker+N|marker-N ; use sequence overlap before first sent original split segment
- --dpi-desync-split-seqovl-pattern=<filename>|0xHEX ; pattern for the fake part of overlap
- --dpi-desync-fakedsplit-pattern=<filename>|0xHEX ; fake pattern for fakedsplit/fakeddisorder
- --dpi-desync-ipfrag-pos-tcp=<8..9216>          ; ip frag position starting from the transport header. multiple of 8, default 8.
- --dpi-desync-ipfrag-pos-udp=<8..9216>          ; ip frag position starting from the transport header. multiple of 8, default 32.
- --dpi-desync-ts-increment=<int|0xHEX>          ; ts fooling TSval signed increment. default -600000
- --dpi-desync-badseq-increment=<int|0xHEX>      ; badseq fooling seq signed increment. default -10000
- --dpi-desync-badack-increment=<int|0xHEX>      ; badseq fooling ackseq signed increment. default -66000
- --dpi-desync-any-protocol=0|1                  ; 0(default)=desync only http and tls  1=desync any nonempty data packet
- --dpi-desync-fake-http=<filename>|0xHEX        ; file containing fake http request
- --dpi-desync-fake-tls=<filename>|0xHEX|!       ; file containing fake TLS ClientHello (for https). '!' = standard fake
- --dpi-desync-fake-tls-mod=mod[,mod]            ; comma separated list of TLS fake mods. available mods : none,rnd,rndsni,sni=<sni>,dupsid,padencap
- --dpi-desync-fake-unknown=<filename>|0xHEX     ; file containing unknown protocol fake payload
- --dpi-desync-fake-syndata=<filename>|0xHEX     ; file containing SYN data payload
- --dpi-desync-fake-quic=<filename>|0xHEX        ; file containing fake QUIC Initial
- --dpi-desync-fake-wireguard=<filename>|0xHEX   ; file containing fake wireguard handshake initiation
- --dpi-desync-fake-dht=<filename>|0xHEX         ; file containing fake DHT (d1..e)
- --dpi-desync-fake-discord=<filename>|0xHEX     ; file containing fake Discord voice connection initiation packet (IP Discovery)
- --dpi-desync-fake-stun=<filename>|0xHEX        ; file containing fake STUN message
- --dpi-desync-fake-unknown-udp=<filename>|0xHEX ; file containing unknown udp protocol fake payload
- --dpi-desync-udplen-increment=<int>            ; increase or decrease udp packet length by N bytes (default 2). negative values decrease length.
- --dpi-desync-udplen-pattern=<filename>|0xHEX   ; udp tail fill pattern
- --dpi-desync-start=[n|d|s]N                    ; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
- --dpi-desync-cutoff=[n|d|s]N                   ; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
- --hostlist=<filename>                          ; apply dpi desync only to the listed hosts (one host per line, subdomains auto apply if not prefixed with `^`, gzip supported, multiple hostlists allowed)
- --hostlist-domains=<domain_list>               ; comma separated fixed domain list
- --hostlist-exclude=<filename>                  ; do not apply dpi desync to the listed hosts (one host per line, subdomains auto apply if not prefixed with `^`, gzip supported, multiple hostlists allowed)
- --hostlist-exclude-domains=<domain_list>       ; comma separated fixed domain list
- --hostlist-auto=<filename>                     ; detect DPI blocks and build hostlist automatically
- --hostlist-auto-fail-threshold=<int>           ; how many failed attempts cause hostname to be added to auto hostlist (default : 3)
- --hostlist-auto-fail-time=<int>                ; all failed attemps must be within these seconds (default : 60)
- --hostlist-auto-retrans-threshold=<int>        ; how many request retransmissions cause attempt to fail (default : 3)
- --hostlist-auto-debug=<logfile>                ; debug auto hostlist positives
- --new                                          ; begin new strategy (new profile)
- --skip                                         ; do not use this profile
- --filter-l3=ipv4|ipv6                          ; L3 protocol filter. multiple comma separated values allowed.
- --filter-tcp=[~]port1[-port2]|*                ; TCP port filter. ~ means negation. setting tcp and not setting udp filter denies udp. comma separated list supported.
- --filter-udp=[~]port1[-port2]|*                ; UDP port filter. ~ means negation. setting udp and not setting tcp filter denies tcp. comma separated list supported.
- --filter-l7=<proto>                            ; L6-L7 protocol filter. multiple comma separated values allowed. proto: http tls quic wireguard dht discord stun unknown
- --filter-ssid=ssid1[,ssid2,ssid3,...]          ; per profile wifi SSID filter
- --ipset=<filename>                             ; ipset include filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
- --ipset-ip=<ip_list>                           ; comma separated fixed subnet list
- --ipset-exclude=<filename>                     ; ipset exclude filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
- --ipset-exclude-ip=<ip_list>                   ; comma separated fixed subnet list
+ --daemon                                                  ; daemonize
+ --pidfile=<filename>                                      ; write pid to file
+ --user=<username>                                         ; drop root privs
+ --uid=uid[:gid1,gid2,...]                                 ; drop root privs
+ --bind-fix4                                               ; apply outgoing interface selection fix for generated ipv4 packets
+ --bind-fix6                                               ; apply outgoing interface selection fix for generated ipv6 packets
+ --wsize=<window_size>[:<scale_factor>]                    ; set window size. 0 = do not modify. OBSOLETE !
+ --wssize=<window_size>[:<scale_factor>]                   ; set window size for server. 0 = do not modify. default scale_factor = 0.
+ --wssize-cutoff=[n|d|s]N                                  ; apply server wsize only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
+ --wssize-forced-cutoff=0|1                                ; 1(default)=auto cutoff wssize on known protocol
+ --ctrack-timeouts=S:E:F[:U]                               ; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default 60:300:60:60
+ --ctrack-disable=[0|1]                                    ; 1 or no argument disables conntrack
+ --ipcache-lifetime=<int>                                  ; time in seconds to keep cached hop count and domain name (default 7200). 0 = no expiration
+ --ipcache-hostname=[0|1]                                  ; 1 or no argument enables ip->hostname caching
+ --hostcase                                                ; change Host: => host:
+ --hostspell                                               ; exact spelling of "Host" header. must be 4 chars. default is "host"
+ --hostnospace                                             ; remove space after Host: and add it to User-Agent: to preserve packet size
+ --domcase                                                 ; mix domain case : Host: TeSt.cOm
+ --methodeol                                               ; add '\n' before method and remove space after Host:
+ --synack-split=[syn|synack|acksyn]                        ; perform TCP split handshake : send SYN only, SYN+ACK or ACK+SYN
+ --orig-ttl=<int>                                          ; set TTL for original packets
+ --orig-ttl6=<int>                                         ; set ipv6 hop limit for original packets. by default ttl value is used
+ --orig-autottl=[<delta>[:<min>[-<max>]]|-]                ; auto ttl mode for both ipv4 and ipv6. default: +5:3-64. "0:0-0" or "-" disables autottl.
+ --orig-autottl6=[<delta>[:<min>[-<max>]]|-]               ; overrides --orig-autottl for ipv6 only
+ --orig-tcp-flags-set=<int|0xHEX|flaglist>                 ; set these tcp flags (flags |= value). value can be int, hex or comma separated list : FIN,SYN,RST,PSH,ACK,URG,ECE,CWR,AE,R1,R2,R3
+ --orig-tcp-flags-unset=<int|0xHEX|flaglist>               ; unset these tcp flags (flags &= ~value)
+ --orig-mod-start=[n|d|s]N                                 ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
+ --orig-mod-cutoff=[n|d|s]N                                ; apply orig TTL mod to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
+ --dup=<int>                                               ; duplicate original packets. send N dups before original.
+ --dup-replace=[0|1]                                       ; 1 or no argument means do not send original, only dups
+ --dup-ttl=<int>                                           ; set TTL for dups
+ --dup-ttl6=<int>                                          ; set ipv6 hop limit for dups. by default ttl value is used
+ --dup-autottl=[<delta>[:<min>[-<max>]]|-]                 ; auto ttl mode for both ipv4 and ipv6. default: -1:3-64. "0:0-0" or "-" disables autottl.
+ --dup-autottl6=[<delta>[:<min>[-<max>]]|-]                ; overrides --dup-autottl for ipv6 only
+ --dup-tcp-flags-set=<int|0xHEX|flaglist>                  ; set these tcp flags (flags |= value). value can be int, hex or comma separated list : FIN,SYN,RST,PSH,ACK,URG,ECE,CWR,AE,R1,R2,R3
+ --dup-tcp-flags-unset=<int|0xHEX|flaglist>                ; unset these tcp flags (flags &= ~value)
+ --dup-fooling=<mode>[,<mode>]                             ; can use multiple comma separated values. modes : none md5sig badseq badsum datanoack hopbyhop hopbyhop2
+ --dup-ts-increment=<int|0xHEX>                            ; ts fooling TSval signed increment for dup. default -600000
+ --dup-badseq-increment=<int|0xHEX>                        ; badseq fooling seq signed increment for dup. default -10000
+ --dup-badack-increment=<int|0xHEX>                        ; badseq fooling ackseq signed increment for dup. default -66000
+ --dup-ip-id=same|zero|seq|rnd                             ; ipv4 ip_id mode for dupped packets
+ --dup-start=[n|d|s]N                                      ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
+ --dup-cutoff=[n|d|s]N                                     ; apply dup to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
+ --ip-id=zero|seq|seqgroup|rnd                             ; ipv4 ip_id assignment scheme
+ --dpi-desync=[<mode0>,]<mode>[,<mode2>]                   ; try to desync dpi state. modes : synack fake fakeknown rst rstack hopbyhop destopt ipfrag1 multisplit multidisorder fakedsplit hostfakesplit fakeddisorder ipfrag2 udplen tamper
+ --dpi-desync-fwmark=<int|0xHEX>                           ; override fwmark for desync packet. default = 0x40000000 (1073741824)
+ --dpi-desync-ttl=<int>                                    ; set ttl for desync packet
+ --dpi-desync-ttl6=<int>                                   ; set ipv6 hop limit for desync packet. by default ttl value is used.
+ --dpi-desync-autottl=[<delta>[:<min>[-<max>]]|-]          ; auto ttl mode for both ipv4 and ipv6. default: -1:3-20. "0:0-0" or "-" disables autottl.
+ --dpi-desync-autottl6=[<delta>[:<min>[-<max>]]|-]         ; overrides --dpi-desync-autottl for ipv6 only
+ --dpi-desync-tcp-flags-set=<int|0xHEX|flaglist>           ; set these tcp flags (flags |= value). value can be int, hex or comma separated list : FIN,SYN,RST,PSH,ACK,URG,ECE,CWR,AE,R1,R2,R3
+ --dpi-desync-tcp-flags-unset=<int|0xHEX|flaglist>         ; unset these tcp flags (flags &= ~value)
+ --dpi-desync-fooling=<mode>[,<mode>]                      ; can use multiple comma separated values. modes : none md5sig ts badseq badsum datanoack hopbyhop hopbyhop2
+ --dpi-desync-repeats=<N>                                  ; send every desync packet N times
+ --dpi-desync-skip-nosni=0|1                               ; 1(default)=do not act on ClientHello without SNI (ESNI ?)
+ --dpi-desync-split-pos=N|-N|marker+N|marker-N             ; comma separated list of split positions
+                                                           ; markers: method,host,endhost,sld,endsld,midsld,sniext
+                                                           ; full list is only used by multisplit and multidisorder
+                                                           ; fakedsplit/fakeddisorder use first l7-protocol-compatible parameter if present, first abs value otherwise
+ --dpi-desync-split-seqovl=N|-N|marker+N|marker-N          ; use sequence overlap before first sent original split segment
+ --dpi-desync-split-seqovl-pattern=[+ofs]@<filename>|0xHEX ; pattern for the fake part of overlap
+ --dpi-desync-fakedsplit-pattern=[+ofs]@<filename>|0xHEX   ; fake pattern for fakedsplit/fakeddisorder
+ --dpi-desync-fakedsplit-mod=mod[,mod]                     ; mods can be none,altorder=0|1|2|3 + 0|8|16
+ --dpi-desync-hostfakesplit-midhost=marker+N|marker-N      ; additionally split real hostname at specified marker. must be within host..endhost or won't be splitted.
+ --dpi-desync-hostfakesplit-mod=mod[,mod]                  ; can be none, host=<hostname>, altorder=0|1
+ --dpi-desync-ipfrag-pos-tcp=<8..9216>                     ; ip frag position starting from the transport header. multiple of 8, default 8.
+ --dpi-desync-ipfrag-pos-udp=<8..9216>                     ; ip frag position starting from the transport header. multiple of 8, default 32.
+ --dpi-desync-ts-increment=<int|0xHEX>                     ; ts fooling TSval signed increment. default -600000
+ --dpi-desync-badseq-increment=<int|0xHEX>                 ; badseq fooling seq signed increment. default -10000
+ --dpi-desync-badack-increment=<int|0xHEX>                 ; badseq fooling ackseq signed increment. default -66000
+ --dpi-desync-any-protocol=0|1                             ; 0(default)=desync only http and tls  1=desync any nonempty data packet
+ --dpi-desync-fake-tcp-mod=mod[,mod]                       ; comma separated list of tcp fake mods. available mods : none,seq
+ --dpi-desync-fake-http=[+ofs]@<filename>|0xHEX            ; file containing fake http request
+ --dpi-desync-fake-tls=[+ofs]@<filename>|0xHEX|![+offset]  ; file containing fake TLS ClientHello (for https). '!' = standard fake
+ --dpi-desync-fake-tls-mod=mod[,mod]                       ; comma separated list of TLS fake mods. available mods : none,rnd,rndsni,sni=<sni>,dupsid,padencap
+ --dpi-desync-fake-unknown=[+ofs]@<filename>|0xHEX         ; file containing unknown protocol fake payload
+ --dpi-desync-fake-syndata=[+ofs]@<filename>|0xHEX         ; file containing SYN data payload
+ --dpi-desync-fake-quic=[+ofs]@<filename>|0xHEX            ; file containing fake QUIC Initial
+ --dpi-desync-fake-wireguard=[+ofs]@<filename>|0xHEX       ; file containing fake wireguard handshake initiation
+ --dpi-desync-fake-dht=[+ofs]@<filename>|0xHEX             ; file containing fake DHT (d1..e)
+ --dpi-desync-fake-discord=[+ofs]@<filename>|0xHEX         ; file containing fake Discord voice connection initiation packet (IP Discovery)
+ --dpi-desync-fake-stun=[+ofs]@<filename>|0xHEX            ; file containing fake STUN message
+ --dpi-desync-fake-unknown-udp=[+ofs]@<filename>|0xHEX     ; file containing unknown udp protocol fake payload
+ --dpi-desync-udplen-increment=<int>                       ; increase or decrease udp packet length by N bytes (default 2). negative values decrease length.
+ --dpi-desync-udplen-pattern=[+ofs]@<filename>|0xHEX       ; udp tail fill pattern
+ --dpi-desync-start=[n|d|s]N                               ; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) greater or equal than N
+ --dpi-desync-cutoff=[n|d|s]N                              ; apply dpi desync only to packet numbers (n, default), data packet numbers (d), relative sequence (s) less than N
+ --hostlist=<filename>                                     ; apply dpi desync only to the listed hosts (one host per line, subdomains auto apply if not prefixed with `^`, gzip supported, multiple hostlists allowed)
+ --hostlist-domains=<domain_list>                          ; comma separated fixed domain list
+ --hostlist-exclude=<filename>                             ; do not apply dpi desync to the listed hosts (one host per line, subdomains auto apply if not prefixed with `^`, gzip supported, multiple hostlists allowed)
+ --hostlist-exclude-domains=<domain_list>                  ; comma separated fixed domain list
+ --hostlist-auto=<filename>                                ; detect DPI blocks and build hostlist automatically
+ --hostlist-auto-fail-threshold=<int>                      ; how many failed attempts cause hostname to be added to auto hostlist (default : 3)
+ --hostlist-auto-fail-time=<int>                           ; all failed attemps must be within these seconds (default : 60)
+ --hostlist-auto-retrans-threshold=<int>                   ; how many request retransmissions cause attempt to fail (default : 3)
+ --hostlist-auto-debug=<logfile>                           ; debug auto hostlist positives
+ --new                                                     ; begin new strategy (new profile)
+ --skip                                                    ; do not use this profile
+ --filter-l3=ipv4|ipv6                                     ; L3 protocol filter. multiple comma separated values allowed.
+ --filter-tcp=[~]port1[-port2]|*                           ; TCP port filter. ~ means negation. setting tcp and not setting udp filter denies udp. comma separated list supported.
+ --filter-udp=[~]port1[-port2]|*                           ; UDP port filter. ~ means negation. setting udp and not setting tcp filter denies tcp. comma separated list supported.
+ --filter-l7=<proto>                                       ; L6-L7 protocol filter. multiple comma separated values allowed. proto: http tls quic wireguard dht discord stun unknown
+ --filter-ssid=ssid1[,ssid2,ssid3,...]                     ; per profile wifi SSID filter
+ --ipset=<filename>                                        ; ipset include filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
+ --ipset-ip=<ip_list>                                      ; comma separated fixed subnet list
+ --ipset-exclude=<filename>                                ; ipset exclude filter (one ip/CIDR per line, ipv4 and ipv6 accepted, gzip supported, multiple ipsets allowed)
+ --ipset-exclude-ip=<ip_list>                              ; comma separated fixed subnet list
 ```
+
+Many parameters dealing with binary data support loading from hex string prefixed by "0x" or from a file.
+Filename can be "as is" or prefixed with "@". If there's "+number" prefix before "@" it means offset of data inside the file.
+Offset must be less that data size.
 
 ### DPI desync attack
 
@@ -288,6 +306,10 @@ Fakes are separate generated by nfqws packets carrying false information for DPI
 * **datanoack** sends tcp fakes without ACK flag. Servers do not accept this but DPI may accept.
   This mode may break NAT and may not work with iptables if masquerade is used, even from the router itself.
   Works with nftables properly. Likely requires external IP address (some ISPs pass these packets through their NAT).
+* Manipulate **tcp flags** with `--dpi-desync-tcp-flags-set` and `--dpi-desync-tcp-flags-unset`.
+  Invalid tcp flags combination may cause server to drop the packet but DPI can accept it.
+  For example, set SYN in fakes. This may not work with all servers.
+  `datanoack` can be replaced to `--dpi-desync-tcp-flags-unset=ACK`.
 * **ts** adds to TSval ts increment value (-600000 by default). Servers discard packets with TSval in some range.
   Practical tests suggest increment between -100 and -0x80000000.
   Timestamps are generated by client OS. In linux timestamps are enabled by default. In windows by default timestamps are disabled.
@@ -314,6 +336,9 @@ Resulting order would be : `fake1 fake1 fake1 fake2 fake2 fake2 fake3 fake3 fake
 
 
 ### FAKE mods
+
+By default all tcp fakes are sent with the same sequence as original packet.
+This can be changed by `--dpi-desync-fake-tcp-mod=seq`. In the latter case all fakes are sent as if they would be tcp segments of a single fake.
 
 **nfqws** has built-in TLS fake. It can be customized with `--dpi-desync-fake-tls` option.
 Customized fake data can be anything - valid TLS Client Hello or arbitrary data.
@@ -343,8 +368,37 @@ Example : `--dpi-desync-fake-tls=iana_org.bin --dpi-desync-fake-tls-mod=rndsni -
 
  * `multisplit`. split request at specified in `--dpi-desync-split-pos` positions
  * `multidisorder`. same as `multisplit` but send in reverse order
- * `fakedsplit`. split request into 2 segments adding fakes in the middle of them : fake 1st segment, 1st segment, fake 1st segment, fake 2nd segment, 2nd segment, fake 2nd segment
- * `fakeddisorder`. same as `fakedsplit` but with another order : fake 2nd segment, 2nd segment, fake 2nd segment, fake 1st segment, 1st segment, fake 1st segment
+ * `fakedsplit`. sequental one position split with fake mix
+ * `hostfakesplit` (altorder=0). fake host part of the request : before host, random fake host, real host (optionally split this part), random fake host repeat, after host
+ * `hostfakesplit` (altorder=1). fake host part of the request : before host, random fake host, after host, real host (optionally split this part)
+ * `fakedsplit`. reverse one position split with fake mix
+
+`--dpi-desync-fakedsplit-mod=altorder=N` specifies number which influence to the presence of individual fakes in `fakedsplit`/`fakeddisorder`.
+
+`fakedsplit` TCP segments of multi-packet messages with split pos :
+
+ * `altorder=0`. fake 1st segment, 1st segment, fake 1st segment, fake 2nd segment, 2nd segment, fake 2nd segment
+ * `altorder=1`. 1st segment, fake 1st segment, fake 2nd segment, 2nd segment, fake 2nd segment
+ * `altorder=2`. 1st segment, fake 2nd segment, 2nd segment, fake 2nd segment
+ * `altorder=3`. 1st segment, fake 2nd segment, 2nd segment
+
+`fakeddisorder` TCP segments of multi-packet messages with split pos :
+
+ * `altorder=0`. fake 2nd segment, 2nd segment, fake 2nd segment, fake 1st segment, 1st segment, fake 1st segment
+ * `altorder=1`. 2nd segment, fake 2nd segment, fake 1st segment, 1st segment, fake 1st segment
+ * `altorder=2`. 2nd segment, fake 1st segment, 1st segment, fake 1st segment
+ * `altorder=3`. 1st segment, fake 1st segment, 1st segment
+
+`fakedsplit`/`fakeddisorder` TCP segments of multi-packet messages without split pos :
+
+ * `altorder=0`. fake, original, fake
+ * `altorder=8`. original, fake
+ * `altorder=16`. original
+
+Resulting `altorder=N` is the sum of two `altorder` parts mentioned above.
+
+`--dpi-desync-fakedsplit-pattern` defines data payload of fakes in `fakedsplit`/`fakeddisorder`. By default pattern is simple `0x00`.
+Offset of split part + offset of current packet in multi-packet message define offset in the pattern.
 
 Positions are defined by markers.
 
@@ -373,6 +427,22 @@ First relative markers are searched. If no suitable found absolute markers are s
 
 For example, `--dpi-desync-split-pos=method+2,midsld,5` means `method+2` for http, `midsld` for TLS and 5 for others.
 
+`--dpi-desync-fakedsplit-mod=altorder=N` switches `fakedsplit` to alternate segment ordering.
+
+`hostfakesplit` only fakes hostname part of the request making it hard to destinguish between real and fake host names.
+It works for tcp protocols with host : TLS and HTTP. Real hostname can be additionally split using `--dpi-desync-hostfakesplit-midhost` marker.
+For example, `--dpi-desync-hostfakesplit-midhost=midsld`. Position must be within host range or split won't happen.
+Multi-packet queries are supported if hostname part is not already split. If it is fooling is cancelled.
+
+By default fake host names are generated randomly on the fly using `[0-9a-z]` pattern. If host length is >= 7 dot is placed to simulate 3-char TLD and last 3 chars are replaces with a random known 3-char TLD.
+It's possible to set fake host template : `--dpi-desync-hostfakesplit-mod=host=<hostname>`.
+Template hostname will be expanded to the left to original hostname size with random characters from `[0-9a-z]` pattern : "www.networksolutions.com" -> "h8xmdba4tv7a8.google.com".
+If original hostname size is less than template size it will be cut : "habr.com" -> "ogle.com".
+If original hostname size is larger than template size by one, dot will be appended to the left : "www.xxx.com" => ".google.com"..
+That's why it's a good idea to use short hostnames in template : "ya.ru", "vk.com", "x.com".
+
+`--dpi-desync-hostfakesplit-mod=altorder=1` switches `hostfakesplit` to alternate segment ordering. `altorder=1` sends the whole request with faked host sequentally, then real host segment.
+
 ### Sequence numbers overlap
 
 `seqovl` adds to one of the original segment `seqovl` bytes to the beginning and decreases sequence number. For `split` - to the first segment, for `disorder` - to the beginning of the penultimate segment sent (second in the original sequence).
@@ -382,6 +452,21 @@ In `disorder` mode OS receives fake and real part of the second segment but does
 All unix OS except Solaris preserve last received data. This is not the case for Windows servers and `disorder` with `seqovl` will not work.
 Disorder requires `seqovl` to be less than split position. Otherwise `seqovl` is not possible and will be cancelled.
 Method allows to avoid separate fakes. Fakes and real data are mixed.
+
+### IP_ID assignment
+
+Some DPIs check ipv4 ip_id value. OS normally increment ip_id value every packet. Some anti-DPI software may send fakes or tcp segments with the same ip_id as original causing block trigger.
+
+Sequental ip_id will be broken in case of sending fakes or additional tcp segments because OS knows nothing about them. But still there are options how to assignt ip_id to generated packets.
+
+`ip-id` parameter sets ip_id assignment scheme for a desync profile :
+
+ * `seq` (default) : increment ip_id for every next packet. in `multidisorder` case increase ip_id for the number of tcp segments then decrease by 1 every packet.
+ * `seqgroup` : same as `seq` but send fake replacements with the same ip_id as original parts. related only to fake tcp segments with the same size and same sequence as originals.
+ * `rnd` : assign random ip_id
+ * `zero` : always set zero. Linux and BSD will send zero, Windows will replace zero with it's own counter.
+
+ipv6 header lacks ip_id field, `ip-id` parameter ignored for ipv6.
 
 ### ipv6 specific modes
 
@@ -440,7 +525,7 @@ There are DPIs that analyze responses from the server, particularly the certific
 In the disorder variant, a selective acknowledgement (SACK) usually arrives first, then a full ACK.
 If, instead of ACK or SACK, there is an RST packet with minimal delay, DPI cuts you off at the request stage.
 If the RST is after a full ACK after a delay of about ping to the server, then probably DPI acts on the server response. The DPI may be satisfied with good ClientHello and stop monitoring the TCP session without checking ServerHello. Then you were lucky. 'fake' option could work.
-If it does not stop monitoring and persistently checks the ServerHello, --wssize parameter may help (see [CONNTRACK](#conntrack)).
+If it does not stop monitoring and persistently checks the ServerHello, `--wssize` parameter may help (see [CONNTRACK](#conntrack)).
 Otherwise it is hardly possible to overcome this without the help of the server.
 The best solution is to enable TLS 1.3 support on the server. TLS 1.3 sends the server certificate in encrypted form.
 This is recommendation to all admins of blocked sites. Enable TLS 1.3. You will give more opportunities to overcome DPI.
@@ -503,7 +588,7 @@ That's why conntrack is required to know when to stop applying low window size.
 If you do not stop and set the low wssize all the time, the speed will drop catastrophically.
 Linux can overcome this using connbytes filter but other OS may not include similar filter.
 
-In http(s) case wssize stops after the first http request or TLS ClientHello.
+In http(s) case wssize stops after the first http request or TLS ClientHello unless `--wssize-forced-cutoff=0` is specified.
 
 If you deal with a non-http(s) protocol you need `--wssize-cutoff`. It sets the threshold where wssize stops.
 
@@ -511,6 +596,7 @@ Threshold can be prefixed with 'n' (packet number starting from 1), 'd' (data pa
 's' (relative sequence number - sent by client bytes + 1).
 
 If a http request or TLS ClientHello packet is detected wssize stops immediately ignoring wssize-cutoff option.
+This action is called "forced wssize cutoff" and can disabled using `--wssize-forced-cutoff=0`.
 
 If your protocol is prone to long inactivity, you should increase ESTABLISHED phase timeout using `--ctrack-timeouts`.
 
@@ -700,6 +786,9 @@ Hypervisor forcibly changes TTL and does not forward fake packets.
 Set up bridge networking.
 
 ### IPTABLES for nfqws
+
+> [!CAUTION]
+> Starting from Linux kernel 6.17 there's CONFIG_NETFILTER_XTABLES_LEGACY parameter which is not set by default. Many distributions will likely not turn it on making iptables-legacy non working. This is part of iptables deprecation. However iptables-nft still works because their backend is based on nftables.
 
 This is the common way to redirect some traffic to nfqws :
 
@@ -1145,7 +1234,7 @@ If `MODE_FILTER=hostlist` all present lists are passed to **nfqws** or **tpws**.
 If all include lists are empty it works like no include lists exist at all.
 If you need "all except" mode you dont have to delete zapret-hosts-users.txt. Just make it empty.
 
-Subdomains auto apply. For example, "ru" in the list affects "*.ru" .
+Subdomains auto apply. For example, "ru" in the list affects "\*.ru" .
 `^` prefix symbol disables subdomain match.
 
 **tpws** and **nfqws** automatically reload lists if their modification time or file size is changed.
@@ -1243,7 +1332,7 @@ Change postnat scheme mark bit
 
 If uncommented pass to zapret only packets marked with this bit
 
-`#FILTER_MARK_POSTNAT=0x10000000`
+`#FILTER_MARK=0x10000000`
 
 Bit must be set in your own rules.
 * iptables - in mangle PREROUTING and mangle OUTPUT before zapret rules (iptables -I _after_ zapret rules application).

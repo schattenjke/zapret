@@ -20,6 +20,7 @@ const char *progname = "nfqws";
 #error UNKNOWN_SYSTEM_TIME
 #endif
 
+const char * tld[6] = { "com","org","net","edu","gov","biz" };
 
 int DLOG_FILE(FILE *F, const char *format, va_list args)
 {
@@ -236,16 +237,17 @@ void dp_init(struct desync_profile *dp)
 	dp->hostlist_auto_fail_time = HOSTLIST_AUTO_FAIL_TIME_DEFAULT;
 	dp->hostlist_auto_retrans_threshold = HOSTLIST_AUTO_RETRANS_THRESHOLD_DEFAULT;
 	dp->filter_ipv4 = dp->filter_ipv6 = true;
+	dp->dup_ip_id_mode = IPID_SAME;
 }
 bool dp_fake_defaults(struct desync_profile *dp)
 {
 	struct blob_item *item;
 	if (blob_collection_empty(&dp->fake_http))
-		if (!blob_collection_add_blob(&dp->fake_http,fake_http_request_default,strlen(fake_http_request_default),0))
+		if (!blob_collection_add_blob(&dp->fake_http,fake_http_request_default,strlen(fake_http_request_default),0,0))
 			return false;
 	if (blob_collection_empty(&dp->fake_tls))
 	{
-		if (!(item=blob_collection_add_blob(&dp->fake_tls,fake_tls_clienthello_default,sizeof(fake_tls_clienthello_default),4+sizeof(((struct fake_tls_mod*)0)->sni))))
+		if (!(item=blob_collection_add_blob(&dp->fake_tls,fake_tls_clienthello_default,sizeof(fake_tls_clienthello_default),4+sizeof(((struct fake_tls_mod*)0)->sni),0)))
 			return false;
 		if (!(item->extra2 = malloc(sizeof(struct fake_tls_mod))))
 			return false;
@@ -253,13 +255,13 @@ bool dp_fake_defaults(struct desync_profile *dp)
 	}
 	if (blob_collection_empty(&dp->fake_unknown))
 	{
-		if (!(item=blob_collection_add_blob(&dp->fake_unknown,NULL,256,0)))
+		if (!(item=blob_collection_add_blob(&dp->fake_unknown,NULL,256,0,0)))
 			return false;
 		memset(item->data,0,item->size);
 	}
 	if (blob_collection_empty(&dp->fake_quic))
 	{
-		if (!(item=blob_collection_add_blob(&dp->fake_quic,NULL,620,0)))
+		if (!(item=blob_collection_add_blob(&dp->fake_quic,NULL,620,0,0)))
 			return false;
 		memset(item->data,0,item->size);
 		item->data[0] = 0x40;
@@ -269,7 +271,7 @@ bool dp_fake_defaults(struct desync_profile *dp)
 	{
 		if (blob_collection_empty(*fake))
 		{
-			if (!(item=blob_collection_add_blob(*fake,NULL,64,0)))
+			if (!(item=blob_collection_add_blob(*fake,NULL,64,0,0)))
 				return false;
 			memset(item->data,0,item->size);
 		}
@@ -297,6 +299,8 @@ struct desync_profile_list *dp_list_add(struct desync_profile_list_head *head)
 }
 static void dp_clear_dynamic(struct desync_profile *dp)
 {
+	free(dp->fsplit_pattern);
+
 	hostlist_collection_destroy(&dp->hl_collection);
 	hostlist_collection_destroy(&dp->hl_collection_exclude);
 	ipset_collection_destroy(&dp->ips_collection);
@@ -371,6 +375,7 @@ void cleanup_params(struct params_s *params)
 #ifdef __CYGWIN__
 	strlist_destroy(&params->ssid_filter);
 	strlist_destroy(&params->nlm_filter);
+	strlist_destroy(&params->wf_raw_part);
 #else
 	free(params->user); params->user=NULL;
 #endif
