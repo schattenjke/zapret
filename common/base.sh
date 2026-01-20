@@ -4,6 +4,10 @@ which()
 	# 'command -v' replacement does not work exactly the same way. it outputs shell aliases if present
 	# $1 - executable name
 	local IFS=:
+	[ "$1" != "${1#/}" ] && [ -x "$1" ] && {
+		echo "$1"
+		return 0
+	}
 	for p in $PATH; do
 	    [ -x "$p/$1" ] && {
 		echo "$p/$1"
@@ -104,6 +108,10 @@ split_by_separator()
 	[ "$after" = "$1" ] && after=
 	[ -n "$3" ] && eval $3="\$before"
 	[ -n "$4" ] && eval $4="\$after"
+}
+tolower()
+{
+	echo "$@" | tr 'A-Z' 'a-z'
 }
 
 dir_is_not_empty()
