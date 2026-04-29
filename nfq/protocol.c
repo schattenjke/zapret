@@ -310,7 +310,7 @@ size_t HttpPos(uint8_t posmarker, int16_t pos, const uint8_t *data, size_t sz)
 			if (sz<10) break;
 			if (*method=='\n' || *method=='\r') method++;
 			if (*method=='\n' || *method=='\r') method++;
-			for (p=method,i=0;i<7;i++) if (*p>='A' && *p<='Z') p++;
+			for (p=method,i=0; i<9 && *p>='A' && *p<='Z'; i++,p++);
 			if (i<3 || *p!=' ') break;
 			return CheckPos(sz,method-data+pos);
 		case PM_HOST:
@@ -795,20 +795,18 @@ bool QUICDecryptInitial(const uint8_t *data, size_t data_len, uint8_t *clean, si
 		return false;
 	}
 
-	uint64_t payload_len,token_len;
-	size_t pn_offset;
+	uint64_t payload_len,token_len,pn_offset;
 	pn_offset = 1 + 4 + 1 + data[5];
 	if (pn_offset >= data_len) return false;
+	// SCID length
 	pn_offset += 1 + data[pn_offset];
-	if ((pn_offset + tvb_get_size(data[pn_offset])) >= data_len) return false;
+	if (pn_offset >= data_len || (pn_offset + tvb_get_size(data[pn_offset])) >= data_len) return false;
+	// token length
 	pn_offset += tvb_get_varint(data + pn_offset, &token_len);
 	pn_offset += token_len;
-	if (pn_offset >= data_len) return false;
-	if ((pn_offset + tvb_get_size(data[pn_offset])) >= data_len) return false;
+	if (pn_offset >= data_len || (pn_offset + tvb_get_size(data[pn_offset])) >= data_len) return false;
 	pn_offset += tvb_get_varint(data + pn_offset, &payload_len);
 	if (payload_len<20 || (pn_offset + payload_len)>data_len) return false;
-
-	aes_init_keygen_tables();
 
 	uint8_t sample_enc[16];
 	aes_context ctx;
@@ -827,13 +825,13 @@ bool QUICDecryptInitial(const uint8_t *data, size_t data_len, uint8_t *clean, si
 
  	phton64(aesiv + sizeof(aesiv) - 8, pntoh64(aesiv + sizeof(aesiv) - 8) ^ pkn);
 
-	size_t cryptlen = payload_len - pkn_len - 16;
+	uint64_t cryptlen = payload_len - pkn_len - 16;
 	if (cryptlen > *clean_len) return false;
-	*clean_len = cryptlen;
+	*clean_len = (size_t)cryptlen;
 	const uint8_t *decrypt_begin = data + pn_offset + pkn_len;
 
-	uint8_t atag[16],header[256];
-	size_t header_len = pn_offset + pkn_len;
+	uint8_t atag[16],header[2048];
+	uint64_t header_len = pn_offset + pkn_len;
 	if (header_len > sizeof(header)) return false; // not likely header will be so large
 	memcpy(header, data, header_len);
 	header[0] = packet0;
@@ -868,7 +866,7 @@ bool QUICDefragCrypto(const uint8_t *clean,size_t clean_len, uint8_t *defrag,siz
 	uint64_t offset,sz,szmax=0,zeropos=0,pos=0;
 	bool found=false;
 	struct range64 ranges[MAX_DEFRAG_PIECES];
-	int i,range=0;
+	int i,j,range=0;
 
 	while(pos<clean_len)
 	{
@@ -890,24 +888,54 @@ bool QUICDefragCrypto(const uint8_t *clean,size_t clean_len, uint8_t *defrag,siz
 			if ((pos+sz)>clean_len) return false;
 
 			if ((offset+sz)>defrag_data_len) return false; // defrag buf overflow
+
+			// remove exact duplicates early to save cpu
+			for(i=0;i<range;i++)
+				if (ranges[i].offset==offset && ranges[i].len==sz)
+					goto skip_range;
+
 			if (zeropos < offset)
 				// make sure no uninitialized gaps exist in case of not full fragment coverage
 				memset(defrag_data+zeropos,0,offset-zeropos);
 			if ((offset+sz) > zeropos)
 				zeropos=offset+sz;
-			memcpy(defrag_data+offset,clean+pos,sz);
-			if ((offset+sz) > szmax) szmax = offset+sz;
 
 			found=true;
-			pos+=sz;
-
+			if ((offset+sz) > szmax) szmax = offset+sz;
+			memcpy(defrag_data+offset,clean+pos,sz);
 			ranges[range].offset = offset;
 			ranges[range].len = sz;
 			range++;
+skip_range:
+			pos+=sz;
 		}
 	}
 	if (found)
 	{
+		qsort(ranges, range, sizeof(*ranges), cmp_range64);
+
+//		for(i=0 ; i<range ; i++)
+//			printf("range1 %llu-%llu\n",ranges[i].offset,ranges[i].offset+ranges[i].len);
+
+		if (range>0)
+		{
+			for (j=0,i=1; i < range; i++)
+			{
+				uint64_t current_end = ranges[j].offset + ranges[j].len;
+				uint64_t next_start = ranges[i].offset;
+				uint64_t next_end = ranges[i].offset + ranges[i].len;
+
+				if (next_start <= current_end)
+					ranges[j].len = MAX(next_end,current_end) - ranges[j].offset;
+				else
+					ranges[++j] = ranges[i];
+			}
+			range = j+1;
+		}
+
+//		for(i=0 ; i<range ; i++)
+//			printf("range2 %llu-%llu\n",ranges[i].offset,ranges[i].offset+ranges[i].len);
+
 		defrag[0] = 6;
 		defrag[1] = 0; // offset
 		// 2..9 - length 64 bit
@@ -916,21 +944,7 @@ bool QUICDefragCrypto(const uint8_t *clean,size_t clean_len, uint8_t *defrag,siz
 		defrag[2] |= 0xC0; // 64 bit value
 		*defrag_len = (size_t)(szmax+10);
 
-		qsort(ranges, range, sizeof(*ranges), cmp_range64);
-
-		//for(i=0 ; i<range ; i++)
-		//	printf("RANGE %zu len %zu\n",ranges[i].offset,ranges[i].len);
-
-		for(i=0,offset=0,*bFull=true ; i<range ; i++)
-		{
-			if (ranges[i].offset!=offset)
-			{
-				*bFull = false;
-				break;
-			}
-			offset += ranges[i].len;
-		}
-
+		*bFull = range==1 && !ranges[0].offset;
 		//printf("bFull=%u\n",*bFull);
 	}
 	return found;
@@ -962,40 +976,41 @@ bool QUICExtractHostFromInitial(const uint8_t *data, size_t data_len, char *host
 
 bool IsQUICInitial(const uint8_t *data, size_t len)
 {
-	// too small packets are not likely to be initials with client hello
+	// too small packets are not likely to be initials
 	// long header, fixed bit
-	if (len < 256 || (data[0] & 0xC0)!=0xC0) return false;
+	if (len < 128) return false;
 
 	uint32_t ver = QUICExtractVersion(data,len);
 	if (QUICDraftVersion(ver) < 11) return false;
 
-	// quic v1 : initial packets are 00b
-	// quic v2 : initial packets are 01b
-	if ((data[0] & 0x30) != (is_quic_v2(ver) ? 0x10 : 0x00)) return false;
+	if ((data[0] & 0xF0) != (is_quic_v2(ver) ? 0xD0 : 0xC0)) return false;
 
-	uint64_t offset=5, sz;
+	uint64_t offset=5, sz, sz2;
 
-	// DCID. must be present
-	if (!data[offset] || data[offset] > QUIC_MAX_CID_LENGTH) return false;
+	// DCID
+	if (data[offset] > QUIC_MAX_CID_LENGTH) return false;
 	offset += 1 + data[offset];
+
+	if (offset>=len) return false;
 
 	// SCID
 	if (data[offset] > QUIC_MAX_CID_LENGTH) return false;
 	offset += 1 + data[offset];
 
 	// token length
+	if (offset>=len || (offset + tvb_get_size(data[offset])) > len) return false;
 	offset += tvb_get_varint(data + offset, &sz);
 	offset += sz;
 	if (offset >= len) return false;
 
 	// payload length
-	if ((offset + tvb_get_size(data[offset])) > len) return false;
+	sz2 = tvb_get_size(data[offset]);
+	if ((offset + sz2) > len) return false;
 	tvb_get_varint(data + offset, &sz);
-	offset += sz;
+	offset += sz2 + sz;
 	if (offset > len) return false;
 
-	// client hello cannot be too small. likely ACK
-	return sz>=96;
+	return true;
 }
 
 
@@ -1020,7 +1035,7 @@ bool IsStunMessage(const uint8_t *data, size_t len)
 {
 	return len>=20 && // header size
 		(data[0]&0xC0)==0 && // 2 most significant bits must be zeroes
-		(data[3]&0b11)==0 && // length must be a multiple of 4
-		ntohl(*(uint32_t*)(&data[4]))==0x2112A442 && // magic cookie
-		ntohs(*(uint16_t*)(&data[2]))==len-20;
+		(data[3]&3)==0 && // length must be a multiple of 4
+		pntoh32(data+4)==0x2112A442 && // magic cookie
+		pntoh16(data+2)<=(len-20);
 }

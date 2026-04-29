@@ -256,6 +256,8 @@ static bool nfq_init(struct nfq_handle **h, struct nfq_q_handle **qh)
 		// dot not fail. not supported on old linuxes <3.6 
 	}
 
+	nfnl_rcvbufsiz(nfq_nfnlh(*h), Q_RCVBUF);
+
 	DLOG_CONDUP("initializing raw sockets bind-fix4=%u bind-fix6=%u\n", params.bind_fix4, params.bind_fix6);
 	if (!rawsend_preinit(params.bind_fix4, params.bind_fix6))
 		goto exiterr;
@@ -350,7 +352,7 @@ static int nfq_main(void)
 			if (rd)
 			{
 				int r = nfq_handle_packet(h, (char *)buf, (int)rd);
-				if (r) DLOG_ERR("nfq_handle_packet error %d\n", r);
+				if (r<0) DLOG_ERR("nfq_handle_packet result %d, errno %d : %s\n", r, errno, strerror(errno));
 			}
 			else
 				DLOG("recv from nfq returned 0 !\n");
@@ -2304,6 +2306,7 @@ int main(int argc, char **argv)
 #endif
 
 	srandom(time(NULL));
+	aes_init_keygen_tables(); // required for aes
 
 	PRINT_VER;
 
@@ -3166,7 +3169,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case IDX_HOSTLIST_AUTO_FAIL_THRESHOLD:
-			dp->hostlist_auto_fail_threshold = (uint8_t)atoi(optarg);
+			dp->hostlist_auto_fail_threshold = atoi(optarg);
 			if (dp->hostlist_auto_fail_threshold < 1 || dp->hostlist_auto_fail_threshold>20)
 			{
 				DLOG_ERR("auto hostlist fail threshold must be within 1..20\n");
@@ -3174,7 +3177,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case IDX_HOSTLIST_AUTO_FAIL_TIME:
-			dp->hostlist_auto_fail_time = (uint8_t)atoi(optarg);
+			dp->hostlist_auto_fail_time = atoi(optarg);
 			if (dp->hostlist_auto_fail_time < 1)
 			{
 				DLOG_ERR("auto hostlist fail time is not valid\n");
@@ -3182,7 +3185,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case IDX_HOSTLIST_AUTO_RETRANS_THRESHOLD:
-			dp->hostlist_auto_retrans_threshold = (uint8_t)atoi(optarg);
+			dp->hostlist_auto_retrans_threshold = atoi(optarg);
 			if (dp->hostlist_auto_retrans_threshold < 2 || dp->hostlist_auto_retrans_threshold>10)
 			{
 				DLOG_ERR("auto hostlist fail threshold must be within 2..10\n");
