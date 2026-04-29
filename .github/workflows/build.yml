@@ -386,7 +386,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [ build-linux ]
+    needs: [ build-linux, build-windows, build-macos, build-freebsd, build-android ]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -467,17 +467,6 @@ jobs:
           done
           ls -lhR
 
-      - name: Push binaries to repo
-        run: |
-          cd ${{ env.repo_dir }}
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git status
-          git add .
-          git commit -m "Added binaries"
-          git fetch origin master
-          git push origin HEAD:master     
-
       - name: Create release bundles
         run: |
           rm -rf ${{ env.repo_dir }}/.git*
@@ -492,6 +481,17 @@ jobs:
           )
           tar --owner=0 --group=0 -czf ${{ env.repo_dir }}-openwrt-embedded.tar.gz ${{ env.repo_dir }}
 
+      - name: Push binaries to repo
+        run: |
+          cd ${{ env.repo_dir }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git status
+          git add .
+          git commit -m "Added binaries"
+          git fetch origin master
+          git push origin HEAD:master    
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -503,4 +503,5 @@ jobs:
           files: |
             zapret*.tar.gz
             zapret*.zip
-            sha256sum.txt
+            sha256sum.txt 
+
